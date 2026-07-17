@@ -52,6 +52,7 @@ def test_split_pdf_writes_verified_student_files(tmp_path, monkeypatch):
     outputs = sorted((tmp_path / "projects" / "exam1" / "materials" / "student_answers").glob("*.pdf"))
     assert len(outputs) == 3
     assert all(len(PdfReader(str(path)).pages) == 2 for path in outputs)
+    assert config.submissions.split_output_dir == "materials/student_answers"
 
 
 def test_split_failure_restores_previous_outputs(tmp_path, monkeypatch):

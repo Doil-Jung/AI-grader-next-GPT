@@ -30,7 +30,7 @@ from config import PROJECTS_DIR, AI_MODELS, OPENAI_AI_MODELS, SCALE_PRESETS, API
 from models.project import (
     ProjectConfig, Criterion, Category, MaterialsConfig,
     ExamConfig, ExamQuestion, ScoringElement, StudentRecord, ScanSplitConfig,
-    ProjectSetup, WORKFLOW_TYPES,
+    ProjectSetup, SubmissionLink, WORKFLOW_TYPES,
     create_project, save_project, load_project, list_projects, delete_project,
     generate_default_prompt, portable_project_path, resolve_project_path,
 )
@@ -46,6 +46,7 @@ from services.pdf_splitter import build_split_plan, split_integrated_pdf, SplitV
 from services.providers import get_provider
 from services.providers.base import ProviderNeedsUserAction
 from services.overview import build_project_overview
+from services.submissions import build_submission_status
 
 
 app = Flask(__name__, template_folder=str(BUNDLE_DIR / "templates"), static_folder=str(BUNDLE_DIR / "static"))
@@ -74,6 +75,57 @@ def _apply_project_setup(config: ProjectConfig, setup_data: dict | None) -> None
         ),
         ai_setup_mode=ai_setup_mode,
     )
+
+
+def _parse_students(raw_students: list[dict], *, require_students: bool = False) -> list[StudentRecord]:
+    students = []
+    for index, item in enumerate(raw_students or [], 1):
+        try:
+            number = int(item.get("number", index))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{index}번째 학생 번호가 올바르지 않습니다.") from exc
+        if number < 1:
+            raise ValueError(f"{index}번째 학생 번호는 1 이상이어야 합니다.")
+        students.append(StudentRecord(
+            number=number,
+            name=str(item.get("name", "")).strip(),
+            grade=str(item.get("grade", "")).strip(),
+            class_name=str(item.get("class_name", "")).strip(),
+            student_id=str(item.get("student_id", "")).strip(),
+        ))
+    if require_students and not students:
+        raise ValueError("학생 명렬을 한 명 이상 입력하세요.")
+    if len({student.number for student in students}) != len(students):
+        raise ValueError("학생 번호가 중복되었습니다.")
+    return students
+
+
+def _set_roster(config: ProjectConfig, students: list[StudentRecord]) -> None:
+    config.submissions.students = list(students)
+    if config.project_type == "exam":
+        config.exam.students = list(students)
+
+
+def _apply_submissions_data(config: ProjectConfig, submissions_data: dict | None) -> None:
+    data = submissions_data or {}
+    if "students" in data:
+        _set_roster(config, _parse_students(data.get("students", [])))
+    if "manual_links" in data:
+        links = []
+        for item in data.get("manual_links", []):
+            file_path = str(item.get("file_path", "")).strip()
+            try:
+                student_number = int(item.get("student_number", 0))
+            except (TypeError, ValueError):
+                continue
+            if file_path and student_number > 0:
+                links.append(SubmissionLink(
+                    file_path=file_path,
+                    student_number=student_number,
+                ))
+        config.submissions.manual_links = links
+    if "split_output_dir" in data:
+        config.submissions.split_output_dir = str(data.get("split_output_dir", ""))
 
 
 # ═══════════════════════════════════════════════════════════
@@ -133,10 +185,7 @@ def _apply_exam_data(config: ProjectConfig, exam_data: dict) -> None:
     if "questions" in exam_data:
         config.exam.questions = _parse_exam_questions(exam_data.get("questions", []))
     if "students" in exam_data:
-        config.exam.students = [
-            StudentRecord(number=int(item.get("number", index)), name=str(item.get("name", "")).strip())
-            for index, item in enumerate(exam_data.get("students", []), 1)
-        ]
+        _set_roster(config, _parse_students(exam_data.get("students", [])))
     if "question_source_path" in exam_data:
         config.exam.question_source_path = str(exam_data["question_source_path"])
     if "rubric_source_path" in exam_data:
@@ -516,6 +565,8 @@ def api_update_project(project_id):
             config.workflow_type = "report"
     if "setup" in data:
         _apply_project_setup(config, data["setup"])
+    if "submissions" in data:
+        _apply_submissions_data(config, data["submissions"])
     if "temperature" in data:
         config.temperature = max(0.0, min(2.0, float(data["temperature"])))
     
@@ -598,6 +649,93 @@ def api_materials(project_id):
     })
 
 
+def _submission_path_key(config: ProjectConfig, value: str) -> str:
+    return str(
+        resolve_project_path(config.id, value, expected_subdir="materials").resolve(strict=False)
+    ).casefold()
+
+
+@app.route("/api/projects/<project_id>/submissions")
+def api_submissions(project_id):
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    return jsonify(build_submission_status(config))
+
+
+@app.route("/api/projects/<project_id>/roster", methods=["PUT"])
+def api_roster(project_id):
+    """보고서·대회·시험이 함께 쓰는 명렬을 저장한다."""
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    try:
+        students = _parse_students((request.json or {}).get("students", []))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    _set_roster(config, students)
+    save_project(config)
+    return jsonify({
+        "success": True,
+        "students": [vars(student) for student in students],
+        "status": build_submission_status(config),
+    })
+
+
+@app.route("/api/projects/<project_id>/submissions/link", methods=["PUT", "DELETE"])
+def api_submission_link(project_id):
+    """자동 파일명 연결 한 건을 다른 학생에게 옮기거나 수동 연결을 해제한다."""
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    data = request.json or {}
+    file_path = str(data.get("file_path", "")).strip()
+    if not file_path:
+        return jsonify({"error": "연결할 파일 경로가 필요합니다."}), 400
+
+    available_files = {
+        _submission_path_key(config, file_info["path"]): file_info["path"]
+        for participant in find_materials(config, apply_links=False)
+        for file_info in participant.get("files", [])
+    }
+    requested_key = _submission_path_key(config, file_path)
+    if requested_key not in available_files:
+        return jsonify({"error": "현재 프로젝트에서 찾을 수 없는 파일입니다."}), 404
+
+    config.submissions.manual_links = [
+        link
+        for link in config.submissions.manual_links
+        if _submission_path_key(config, link.file_path) != requested_key
+    ]
+    if request.method == "PUT":
+        try:
+            student_number = int(data.get("student_number", 0))
+        except (TypeError, ValueError):
+            student_number = 0
+        if student_number < 1:
+            return jsonify({"error": "연결할 학생 번호가 올바르지 않습니다."}), 400
+        roster_numbers = {student.number for student in config.roster_students}
+        if roster_numbers and student_number not in roster_numbers:
+            return jsonify({"error": "명렬에 없는 학생 번호입니다."}), 400
+        config.submissions.manual_links.append(SubmissionLink(
+            file_path=portable_project_path(config.id, available_files[requested_key]),
+            student_number=student_number,
+        ))
+
+    save_project(config)
+    return jsonify({"success": True, "status": build_submission_status(config)})
+
+
+@app.route("/api/projects/<project_id>/submissions/links/reset", methods=["POST"])
+def api_reset_submission_links(project_id):
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    config.submissions.manual_links = []
+    save_project(config)
+    return jsonify({"success": True, "status": build_submission_status(config)})
+
+
 @app.route("/api/projects/<project_id>/upload", methods=["POST"])
 def api_upload_file(project_id):
     config = load_project(project_id)
@@ -672,25 +810,18 @@ def api_exam_sources(project_id):
 
 @app.route("/api/projects/<project_id>/exam/students", methods=["PUT"])
 def api_exam_students(project_id):
-    """통합 스캔 순서와 같은 학생 명렬을 저장."""
+    """구형 API 호환: 공통 명렬과 시험 분할 명렬을 함께 저장."""
     config = load_project(project_id)
     if not config:
         return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
-    data = request.json or {}
-    students = []
-    for index, item in enumerate(data.get("students", []), 1):
-        try:
-            number = int(item.get("number", index))
-        except (TypeError, ValueError):
-            return jsonify({"error": f"{index}번째 학생 번호가 올바르지 않습니다."}), 400
-        if number < 1:
-            return jsonify({"error": f"{index}번째 학생 번호는 1 이상이어야 합니다."}), 400
-        students.append(StudentRecord(number=number, name=str(item.get("name", "")).strip()))
-    if not students:
-        return jsonify({"error": "학생 명렬을 입력하세요."}), 400
-    if len({student.number for student in students}) != len(students):
-        return jsonify({"error": "학생 번호가 중복되었습니다."}), 400
-    config.exam.students = students
+    try:
+        students = _parse_students(
+            (request.json or {}).get("students", []),
+            require_students=True,
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    _set_roster(config, students)
     save_project(config)
     return jsonify({"success": True, "students": [vars(student) for student in students]})
 
@@ -706,7 +837,7 @@ def api_exam_split_preview(project_id):
             resolve_project_path(
                 project_id, config.exam.scan_split.source_path, expected_subdir="exam_sources"
             ),
-            config.exam.students,
+            config.roster_students,
             start_page=data.get("start_page", 1),
             pages_per_student=data.get("pages_per_student", 0),
             boundaries=data.get("boundaries", []),

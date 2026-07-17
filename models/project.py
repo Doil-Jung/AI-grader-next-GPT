@@ -12,7 +12,7 @@ from typing import Optional
 from config import PROJECTS_DIR
 
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 WORKFLOW_TYPES = ("report", "competition", "exam")
 
@@ -149,9 +149,27 @@ class ExamQuestion:
 
 @dataclass
 class StudentRecord:
-    """통합 스캔 분할에 사용하는 학생 명렬."""
+    """프로젝트 공통 명렬과 통합 스캔 분할에 사용하는 학생·모둠."""
     number: int
     name: str = ""
+    grade: str = ""
+    class_name: str = ""
+    student_id: str = ""
+
+
+@dataclass
+class SubmissionLink:
+    """자동 연결을 교사가 수정한 단일 파일 연결."""
+    file_path: str
+    student_number: int
+
+
+@dataclass
+class SubmissionsConfig:
+    """프로젝트 유형에 공통으로 사용하는 명렬과 제출물 연결 설정."""
+    students: list[StudentRecord] = field(default_factory=list)
+    manual_links: list[SubmissionLink] = field(default_factory=list)
+    split_output_dir: str = ""
 
 
 @dataclass
@@ -213,6 +231,9 @@ class ProjectConfig:
     
     # 심사자료
     materials: MaterialsConfig = field(default_factory=MaterialsConfig)
+
+    # 공통 학생·답안 연결
+    submissions: SubmissionsConfig = field(default_factory=SubmissionsConfig)
     
     # 채점 기준
     categories: list[Category] = field(default_factory=list)
@@ -236,6 +257,11 @@ class ProjectConfig:
     @property
     def all_exam_questions(self) -> list[ExamQuestion]:
         return list(self.exam.questions)
+
+    @property
+    def roster_students(self) -> list[StudentRecord]:
+        """구형 시험 명렬도 공통 명렬처럼 읽을 수 있게 한다."""
+        return list(self.submissions.students or self.exam.students)
     
     def to_dict(self) -> dict:
         exam_data = asdict(self.exam)
@@ -248,6 +274,12 @@ class ProjectConfig:
         exam_data["scan_split"]["source_path"] = portable_project_path(
             self.id, self.exam.scan_split.source_path
         )
+        submissions_data = asdict(self.submissions)
+        submissions_data["split_output_dir"] = portable_project_path(
+            self.id, self.submissions.split_output_dir
+        )
+        for link in submissions_data["manual_links"]:
+            link["file_path"] = portable_project_path(self.id, link["file_path"])
         return {
             "id": self.id,
             "name": self.name,
@@ -262,6 +294,7 @@ class ProjectConfig:
             "ai_provider": self.ai_provider,
             "temperature": self.temperature,
             "materials": asdict(self.materials),
+            "submissions": submissions_data,
             "categories": [
                 {
                     "name": cat.name,
@@ -347,10 +380,19 @@ class ProjectConfig:
                 core_criteria=[str(v).strip() for v in q_data.get("core_criteria", []) if str(v).strip()],
             ))
 
-        students = [
-            StudentRecord(number=int(s.get("number", i)), name=s.get("name", ""))
-            for i, s in enumerate(exam_data.get("students", []), 1)
-        ]
+        def parse_students(raw_students: list[dict]) -> list[StudentRecord]:
+            return [
+                StudentRecord(
+                    number=int(student.get("number", index)),
+                    name=str(student.get("name", "")),
+                    grade=str(student.get("grade", "")),
+                    class_name=str(student.get("class_name", "")),
+                    student_id=str(student.get("student_id", "")),
+                )
+                for index, student in enumerate(raw_students or [], 1)
+            ]
+
+        students = parse_students(exam_data.get("students", []))
         split_data = exam_data.get("scan_split", {}) or {}
         scan_split = ScanSplitConfig(
             source_path=split_data.get("source_path", ""),
@@ -380,6 +422,31 @@ class ProjectConfig:
             questions=exam_questions,
             students=students,
             scan_split=scan_split,
+        )
+
+        submissions_data = data.get("submissions", {}) or {}
+        submission_students = parse_students(submissions_data.get("students", []))
+        if not submission_students and students:
+            submission_students = list(students)
+        elif submission_students and not students and project_type == "exam":
+            students = list(submission_students)
+            exam.students = list(submission_students)
+        manual_links = []
+        for item in submissions_data.get("manual_links", []):
+            try:
+                student_number = int(item.get("student_number"))
+            except (TypeError, ValueError):
+                continue
+            file_path = str(item.get("file_path", "")).strip()
+            if file_path and student_number > 0:
+                manual_links.append(SubmissionLink(
+                    file_path=file_path,
+                    student_number=student_number,
+                ))
+        submissions = SubmissionsConfig(
+            students=submission_students,
+            manual_links=manual_links,
+            split_output_dir=str(submissions_data.get("split_output_dir", "")),
         )
         
         provider_aliases = {
@@ -421,6 +488,7 @@ class ProjectConfig:
             ai_provider=normalized_provider,
             temperature=data.get("temperature", 0.2),
             materials=materials,
+            submissions=submissions,
             categories=categories,
             exam=exam,
             prompt_template=data.get("prompt_template", ""),

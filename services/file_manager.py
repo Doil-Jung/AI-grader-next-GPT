@@ -6,11 +6,56 @@
 import re
 from pathlib import Path
 from typing import Optional
-from models.project import ProjectConfig
+from models.project import ProjectConfig, resolve_project_path
 from config import SUPPORTED_FILE_TYPES, PROJECTS_DIR
 
 
-def find_materials(config: ProjectConfig) -> list[dict]:
+def _path_key(value: str | Path) -> str:
+    return str(Path(value).resolve(strict=False)).casefold()
+
+
+def _apply_manual_links(config: ProjectConfig, participants: list[dict]) -> list[dict]:
+    """교사가 수정한 파일 연결을 자동 파일명 연결 위에 덧씌운다."""
+    if not config.submissions.manual_links:
+        return participants
+
+    links = {}
+    for link in config.submissions.manual_links:
+        resolved = resolve_project_path(
+            config.id, link.file_path, expected_subdir="materials"
+        )
+        links[_path_key(resolved)] = link.student_number
+
+    roster_names = {
+        student.number: student.name
+        for student in config.roster_students
+        if student.name
+    }
+    rebuilt: dict[int, dict] = {}
+    for participant in participants:
+        for file_info in participant.get("files", []):
+            original_number = participant["number"]
+            target_number = links.get(_path_key(file_info["path"]), original_number)
+            manually_linked = target_number != original_number or _path_key(file_info["path"]) in links
+            if target_number not in rebuilt:
+                rebuilt[target_number] = {
+                    "number": target_number,
+                    "name": (
+                        roster_names.get(target_number)
+                        if manually_linked
+                        else participant.get("name", f"참가자 {target_number}")
+                    ) or f"참가자 {target_number}",
+                    "files": [],
+                }
+            copied = dict(file_info)
+            copied["manual_link"] = manually_linked
+            copied["auto_number"] = original_number
+            rebuilt[target_number]["files"].append(copied)
+
+    return sorted(rebuilt.values(), key=lambda item: item["number"])
+
+
+def find_materials(config: ProjectConfig, *, apply_links: bool = True) -> list[dict]:
     """프로젝트 설정에 따라 심사자료를 탐색하여 참가자 목록 반환
     - 폴더 스캔 결과 + 프로젝트 materials 폴더의 추가 파일을 합침
     - excluded_files에 포함된 파일은 제외
@@ -46,11 +91,8 @@ def find_materials(config: ProjectConfig) -> list[dict]:
             if not participants[num]["files"]:
                 del participants[num]
     
-    # 폴더도 없고 업로드도 없으면 업로드 전용 모드
-    if not participants and config.materials.source_type == "upload":
-        return uploaded
-    
-    return sorted(participants.values(), key=lambda x: x["number"])
+    result = sorted(participants.values(), key=lambda x: x["number"])
+    return _apply_manual_links(config, result) if apply_links else result
 
 
 def _scan_folder(config: ProjectConfig) -> list[dict]:
@@ -140,9 +182,19 @@ def _scan_folder(config: ProjectConfig) -> list[dict]:
             "size_mb": round(file_path.stat().st_size / 1024 / 1024, 1),
         })
     
-    # 매칭 안 된 파일도 순번으로 포함 (파일 1개 = 참가자 1명)
-    if unmatched_files and not participants:
-        for i, file_path in enumerate(sorted(unmatched_files), 1):
+    # 일부 파일만 이름 규칙에 맞지 않아도 숨기지 않는다.
+    # 전부 미인식이면 기존처럼 1번부터 임시 번호를 붙이고, 일부만 미인식이면
+    # 실제 명렬·인식 번호 뒤의 임시 번호를 붙여 교사가 연결을 바로잡게 한다.
+    if unmatched_files:
+        if participants:
+            used_numbers = list(participants) + [
+                student.number for student in config.roster_students
+            ]
+            first_unmatched_number = max(used_numbers, default=0) + 1
+        else:
+            first_unmatched_number = 1
+        for offset, file_path in enumerate(sorted(unmatched_files)):
+            i = first_unmatched_number + offset
             ext = file_path.suffix.lower()
             file_category = "other"
             for cat, exts in SUPPORTED_FILE_TYPES.items():

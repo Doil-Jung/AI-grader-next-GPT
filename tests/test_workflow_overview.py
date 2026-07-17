@@ -6,6 +6,7 @@ import services.file_manager as file_manager
 import services.grading as grading
 import services.overview as overview
 import services.pdf_splitter as splitter
+import services.submissions as submissions
 from models.project import ProjectConfig
 
 
@@ -18,6 +19,7 @@ def configure_temp_projects(tmp_path, monkeypatch):
         grading,
         overview,
         splitter,
+        submissions,
     ):
         monkeypatch.setattr(module, "PROJECTS_DIR", projects)
     projects.mkdir()

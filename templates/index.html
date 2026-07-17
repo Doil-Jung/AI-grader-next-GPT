@@ -242,15 +242,42 @@
 
 <!-- 심사자료 탭 -->
 <div class="tab-content" id="tab-materials">
-  <div class="card" id="examIntegratedMaterialsCard" style="display:none">
-    <h2>📝 학생 명렬과 통합 스캔</h2>
-    <p style="font-size:.82rem;color:var(--text2);line-height:1.6">한 반 통합 PDF를 학생별 답지로 나눕니다. 분할 뒤에는 짧은 학생 답지들을 이용해 전체 문항과 채점기준을 복원할 수 있습니다.</p>
-    <div class="form-row">
-      <div class="form-group" style="flex:1.2">
-        <label>학생 명렬 - 스캔 순서대로 한 줄에 한 명</label>
-        <textarea id="examStudents" rows="8" placeholder="1, 홍길동&#10;2, 김과학&#10;3, 이탐구"></textarea>
+  <div class="card">
+    <div class="section-heading compact">
+      <div>
+        <span class="eyebrow">1. 채점 대상</span>
+        <h2>학생·모둠 명렬</h2>
+        <p>한 줄에 한 명씩 `번호, 이름` 형식으로 붙여넣으세요. 명렬 없이 파일명만으로 시작하는 것도 가능합니다.</p>
       </div>
-      <div class="form-group" style="flex:1">
+    </div>
+    <div class="form-row">
+      <div class="form-group" style="grid-column:span 2">
+        <label>명렬 — 스캔 또는 제출 순서대로 입력</label>
+        <textarea id="rosterInput" rows="7" placeholder="1, 홍길동&#10;2, 김과학&#10;3, 이탐구"></textarea>
+      </div>
+      <div>
+        <div class="info-callout" style="margin:0 0 10px">
+          번호는 파일명과 답안 분할의 기준입니다. 예: <strong>1. 홍길동.pdf</strong>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-primary" onclick="saveRosterFromUI()">명렬 저장</button>
+          <button class="btn btn-secondary" onclick="inferRosterFromFiles()">파일명에서 채우기</button>
+        </div>
+        <div id="rosterStatus" class="inline-status"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" id="examIntegratedMaterialsCard" style="display:none">
+    <div class="section-heading compact">
+      <div>
+        <span class="eyebrow">2. 정기고사 답안 준비</span>
+        <h2>한 반 통합 스캔 분할</h2>
+        <p>위 명렬 순서대로 한 반 통합 PDF를 학생별 답지로 나눕니다. 이미 학생별 PDF가 있다면 이 과정은 건너뛰고 아래에서 파일을 추가하세요.</p>
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group">
         <label>한 반 통합 스캔 PDF</label>
         <input type="file" id="examScanFile" accept=".pdf">
         <button class="btn btn-primary btn-sm" onclick="uploadExamScan()" style="margin-top:8px">통합 PDF 저장</button>
@@ -268,15 +295,19 @@
       <button class="btn btn-primary" onclick="generateExamRubricFromSplit()">분할 답지에서 문항·기준 생성</button>
       <span id="examSplitStatus" style="font-size:.85rem;color:var(--text2)"></span>
     </div>
+    <div class="split-output" id="examSplitOutput" style="display:none">
+      <div><span>학생별 PDF 저장 위치</span><strong id="examSplitOutputPath"></strong></div>
+      <button class="btn btn-secondary btn-sm" onclick="openSplitOutputFolder()">📂 폴더 열기</button>
+    </div>
     <div id="examSplitPreview" style="margin-top:16px"></div>
   </div>
 
   <div class="card">
     <div class="section-heading compact">
       <div>
-        <span class="eyebrow">채점 대상 연결</span>
-        <h2>학생·답안 자료</h2>
-        <p>학생 또는 모둠 번호로 시작하는 파일을 연결하면 자동으로 묶어서 보여줍니다.</p>
+        <span class="eyebrow" id="submissionSourceStep">2. 답안 가져오기</span>
+        <h2>제출 파일과 답안 연결</h2>
+        <p>학생 또는 모둠 번호로 시작하는 파일을 연결하면 자동으로 명렬과 대조합니다. 잘못 연결된 파일만 아래에서 고치면 됩니다.</p>
       </div>
     </div>
     <input type="hidden" id="matSource" value="folder">
@@ -297,13 +328,15 @@
       <div class="form-group"><label>파일명 패턴 (정규식)</label><input id="matPattern" value="(\d+)\.\s*(.+)"></div>
     </div>
     <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;align-items:center">
-      <button class="btn btn-primary btn-sm" onclick="saveMaterials()">💾 설정저장 및 스캔</button>
+      <button class="btn btn-primary btn-sm" onclick="saveMaterials()">💾 설정 저장·다시 확인</button>
       <button class="btn btn-success btn-sm" onclick="startSelectedGrading()">▶️ 선택 채점</button>
       <button class="btn btn-secondary btn-sm" onclick="convertHwp()" id="btnConvertHwp" style="display:flex;align-items:center;gap:6px">
         <span style="font-size:1.1em">🔄</span> 문서 → PDF 변환
       </button>
+      <button class="btn btn-secondary btn-sm" onclick="resetSubmissionLinks()">수동 연결 초기화</button>
       <span id="hwpConvertStatus" style="font-size:.8rem;color:var(--text2)"></span>
     </div>
+    <div id="submissionSummary" class="submission-summary"></div>
     <div id="materialsList"></div>
   </div>
 </div>

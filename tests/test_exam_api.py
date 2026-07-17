@@ -9,6 +9,7 @@ import models.project as project_model
 import services.file_manager as file_manager
 import services.grading as grading
 import services.pdf_splitter as splitter
+import services.submissions as submissions
 
 
 def pdf_bytes(pages: int) -> io.BytesIO:
@@ -23,7 +24,7 @@ def pdf_bytes(pages: int) -> io.BytesIO:
 
 def configure_temp_projects(tmp_path, monkeypatch):
     projects = tmp_path / "projects"
-    for module in (app_module, project_model, file_manager, grading, splitter):
+    for module in (app_module, project_model, file_manager, grading, splitter, submissions):
         monkeypatch.setattr(module, "PROJECTS_DIR", projects)
     projects.mkdir()
     return projects
@@ -46,11 +47,20 @@ def test_exam_upload_split_and_approval_flow(tmp_path, monkeypatch):
 
     students = [{"number": 1, "name": "가"}, {"number": 2, "name": "나"}, {"number": 3, "name": "다"}]
     assert client.put(f"/api/projects/{project_id}/exam/students", json={"students": students}).status_code == 200
+    detail = client.get(f"/api/projects/{project_id}").get_json()
+    assert [
+        {"number": student["number"], "name": student["name"]}
+        for student in detail["submissions"]["students"]
+    ] == students
     preview = client.post(f"/api/projects/{project_id}/exam/split/preview", json={"pages_per_student": 2})
     assert preview.status_code == 200
     assert len(preview.get_json()["entries"]) == 3
     completed = client.post(f"/api/projects/{project_id}/exam/split", json={"pages_per_student": 2})
     assert completed.status_code == 200
+    assert completed.get_json()["output_dir"].endswith("student_answers")
+    submission_status = client.get(f"/api/projects/{project_id}/submissions").get_json()
+    assert submission_status["split"]["exists"] is True
+    assert submission_status["split"]["file_count"] == 3
 
     config = project_model.load_project(project_id)
     config.exam.questions = app_module._parse_exam_questions([{

@@ -160,3 +160,30 @@ tr.clickable{cursor:pointer}
   .readiness-grid{grid-template-columns:1fr}
   .wizard-progress{grid-template-columns:repeat(2,1fr)}
 }
+
+/* 학생·답안 통합 */
+.inline-status{font-size:.8rem;color:var(--text2);margin-top:10px;line-height:1.45}
+.inline-status.success{color:var(--success);margin-left:auto}
+.inline-status.danger{color:var(--danger)}
+.split-output{margin-top:16px;padding:13px 15px;border:1px solid rgba(52,211,153,.35);background:rgba(52,211,153,.07);border-radius:10px;display:flex;align-items:center;justify-content:space-between;gap:12px}
+.split-output>div{min-width:0;display:flex;flex-direction:column;gap:4px}
+.split-output span{color:var(--text2);font-size:.72rem}
+.split-output strong{font-size:.8rem;overflow-wrap:anywhere}
+.submission-summary{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.submission-file-list{display:flex;flex-direction:column;gap:8px;min-width:320px}
+.submission-file-row{display:grid;grid-template-columns:minmax(170px,1fr) auto;gap:8px;align-items:center}
+.submission-file-row>.chip{border:0;color:var(--text);font-family:inherit;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;justify-self:start;max-width:100%}
+.submission-file-row>.chip:hover{color:var(--primary2)}
+.submission-file-actions{display:flex;gap:6px;align-items:center;justify-content:flex-end;flex-wrap:wrap}
+.submission-file-actions select{padding:6px 8px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:inherit;font-size:.76rem;min-width:110px}
+.submission-row small{display:block;color:var(--text2);font-size:.72rem;margin-top:4px}
+.submission-status{display:inline-flex;padding:3px 8px;border-radius:999px;font-size:.72rem;font-weight:700;white-space:nowrap}
+.submission-status.status-ready{background:rgba(52,211,153,.15);color:var(--success)}
+.submission-status.status-missing{background:rgba(248,113,113,.15);color:var(--danger)}
+.submission-status.status-name_mismatch,.submission-status.status-multiple_files,.submission-status.status-unregistered{background:rgba(251,191,36,.15);color:var(--warning)}
+.submission-row.status-missing,.submission-row.status-name_mismatch,.submission-row.status-multiple_files,.submission-row.status-unregistered{background:rgba(251,191,36,.035)}
+@media(max-width:760px){
+  .submission-file-list{min-width:260px}
+  .submission-file-row{grid-template-columns:1fr}
+  .submission-file-actions{justify-content:flex-start}
+}

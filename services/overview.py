@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from config import PROJECTS_DIR
 from models.project import ProjectConfig
-from services.file_manager import find_materials
 from services.grading import load_completed
+from services.submissions import build_submission_status
 
 
 WORKFLOW_LABELS = {
@@ -55,13 +55,14 @@ def _round_summaries(project_id: str) -> list[dict]:
 
 def build_project_overview(config: ProjectConfig) -> dict:
     """기존 프로젝트 파일을 변경하지 않고 개요용 파생 상태를 만든다."""
-    materials = find_materials(config)
-    participant_count = len(materials)
-    material_file_count = sum(len(item.get("files", [])) for item in materials)
+    submission_status = build_submission_status(config)
+    submission_summary = submission_status["summary"]
+    participant_count = submission_summary["participant_count"]
+    material_file_count = submission_summary["file_count"]
 
     if config.project_type == "exam":
         criteria_count = len(config.exam.questions)
-        expected_count = len(config.exam.students) or config.setup.expected_count
+        expected_count = len(config.roster_students) or config.setup.expected_count
         criteria_label = (
             f"{criteria_count}개 문항 준비됨" if criteria_count else "문항·채점기준이 필요함"
         )
@@ -80,7 +81,7 @@ def build_project_overview(config: ProjectConfig) -> dict:
     review_required_count = latest_round["review_required_count"] if latest_round else 0
 
     criteria_ready = criteria_count > 0
-    submissions_ready = participant_count > 0
+    submissions_ready = submission_status["all_ready"]
     grading_started = bool(rounds)
     grading_complete = grading_started and (
         not participant_count or completed_count >= participant_count
@@ -159,8 +160,16 @@ def build_project_overview(config: ProjectConfig) -> dict:
             "participant_count": participant_count,
             "expected_count": expected_count,
             "file_count": material_file_count,
+            "attention_count": submission_summary["attention_count"],
             "label": (
-                f"{participant_count}명·{material_file_count}개 파일"
+                (
+                    f"{participant_count}명·{material_file_count}개 파일"
+                    + (
+                        f" · 확인 {submission_summary['attention_count']}건"
+                        if submission_summary["attention_count"]
+                        else ""
+                    )
+                )
                 if participant_count
                 else "연결된 답안 자료 없음"
             ),

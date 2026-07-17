@@ -4,6 +4,8 @@ let eventSource = null;
 let submissionData = [];
 let currentOverview = null;
 let wizardStep = 1;
+let currentSubmissionStatus = null;
+let submissionFilesByIndex = [];
 
 const WORKFLOW_LABELS = {
   report: '보고서·수행평가',
@@ -94,6 +96,8 @@ async function selectProject(id, skipTabSwitch) {
   const res = await fetch(`/api/projects/${id}`);
   if (!res.ok) throw new Error('프로젝트를 불러오지 못했습니다.');
   currentProject = await res.json();
+  currentSubmissionStatus = null;
+  submissionFilesByIndex = [];
   currentProject.workflow_type = currentProject.workflow_type || (currentProject.project_type === 'exam' ? 'exam' : 'report');
   updateAppShell();
   localStorage.setItem('lastProjectId', id);
@@ -400,6 +404,8 @@ function updateProjectModeUI() {
   document.getElementById('thApproval').style.display = isExam ? '' : 'none';
   const rankingCard = document.getElementById('competitionRankingCard');
   if (rankingCard) rankingCard.style.display = currentProject?.workflow_type === 'competition' ? '' : 'none';
+  const sourceStep = document.getElementById('submissionSourceStep');
+  if (sourceStep) sourceStep.textContent = isExam ? '3. 답안 가져오기' : '2. 답안 가져오기';
   updateAppShell();
 }
 
@@ -514,8 +520,11 @@ function collectRubricFromEditor() {
 function renderExamSettings() {
   if (!currentProject) return;
   if (!currentProject.exam) currentProject.exam = { questions: [], students: [], scan_split: {} };
-  const students = currentProject.exam.students || [];
-  document.getElementById('examStudents').value = students.map(s => `${s.number}, ${s.name || ''}`).join('\n');
+  const students = currentProject.submissions?.students || currentProject.exam.students || [];
+  const rosterInput = document.getElementById('rosterInput');
+  if (rosterInput) rosterInput.value = students.map(s => `${s.number}, ${s.name || ''}`).join('\n');
+  const rosterStatus = document.getElementById('rosterStatus');
+  if (rosterStatus) rosterStatus.textContent = '';
   const split = currentProject.exam.scan_split || {};
   document.getElementById('examStartPage').value = split.start_page || 1;
   document.getElementById('examPagesPerStudent').value = split.pages_per_student || 0;
@@ -529,6 +538,7 @@ function renderExamSettings() {
   document.getElementById('examSourceStatus').textContent = currentProject.exam.rubric_source_path
     ? `✅ 공식 기준표 적용됨: ${currentProject.exam.rubric_source_path.split(/[\\/]/).pop()}`
     : '';
+  renderSplitOutput('', false);
   renderExamQuestions();
 }
 
@@ -790,20 +800,55 @@ async function generateExamRubricFromSplit() {
 }
 
 function parseStudentLines() {
-  return document.getElementById('examStudents').value.split(/\r?\n/).map((line, index) => {
-    const match = line.trim().match(/^(\d+)\s*[,\t.\-]?\s*(.*)$/);
-    if (!match) return null;
-    return { number: parseInt(match[1]), name: match[2].trim() || `학생 ${match[1]}` };
+  const input = document.getElementById('rosterInput');
+  let nextNumber = 1;
+  return (input?.value || '').split(/\r?\n/).map(line => {
+    const value = line.trim();
+    if (!value) return null;
+    const match = value.match(/^(\d+)\s*[,\t.\-]?\s*(.*)$/);
+    if (match) {
+      const number = parseInt(match[1]);
+      nextNumber = Math.max(nextNumber, number + 1);
+      return { number, name: match[2].trim() || `학생 ${match[1]}` };
+    }
+    return { number: nextNumber++, name: value };
   }).filter(Boolean);
 }
 
-async function saveExamStudents() {
+async function saveRoster(options = {}) {
+  if (!currentProject) throw new Error('프로젝트를 먼저 선택하세요.');
   const students = parseStudentLines();
-  if (!students.length) throw new Error('학생 명렬을 입력하세요.');
-  const res = await fetch(`/api/projects/${currentProject.id}/exam/students`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ students }) });
+  if (options.requireStudents && !students.length) throw new Error('학생 명렬을 입력하세요.');
+  const status = document.getElementById('rosterStatus');
+  if (status) status.textContent = '저장 중...';
+  const res = await fetch(`/api/projects/${currentProject.id}/roster`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ students }),
+  });
   const data = await res.json();
-  if (!res.ok) throw new Error(data.error || '학생 명렬 저장 실패');
-  currentProject.exam.students = data.students;
+  if (!res.ok) {
+    if (status) status.textContent = `❌ ${data.error || '명렬 저장 실패'}`;
+    throw new Error(data.error || '명렬 저장 실패');
+  }
+  if (!currentProject.submissions) currentProject.submissions = {};
+  currentProject.submissions.students = data.students;
+  if (currentProject.project_type === 'exam') currentProject.exam.students = data.students;
+  if (status) status.textContent = `✅ ${data.students.length}명 저장`;
+  renderSubmissionStatus(data.status);
+  return data.students;
+}
+
+async function saveRosterFromUI() {
+  try {
+    await saveRoster();
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
+async function saveExamStudents() {
+  return saveRoster({ requireStudents: true });
 }
 
 async function uploadExamScan() {
@@ -835,6 +880,27 @@ function renderSplitPlan(data) {
   html += '</tbody></table></div>';
   if (data.unused_pages?.length) html += `<div style="color:var(--warning);margin-top:8px">사용하지 않는 뒤쪽 페이지: ${data.unused_pages.join(', ')}</div>`;
   el.innerHTML = html;
+  if (data.output_dir) renderSplitOutput(data.output_dir);
+}
+
+function renderSplitOutput(outputDir, exists = Boolean(outputDir), fileCount = 0) {
+  const container = document.getElementById('examSplitOutput');
+  const path = document.getElementById('examSplitOutputPath');
+  if (!container || !path) return;
+  if (!outputDir || !exists) {
+    container.style.display = 'none';
+    path.textContent = '';
+    return;
+  }
+  container.style.display = '';
+  path.textContent = fileCount ? `${outputDir} · PDF ${fileCount}개` : outputDir;
+  container.dataset.path = outputDir;
+}
+
+function openSplitOutputFolder() {
+  const container = document.getElementById('examSplitOutput');
+  const path = container?.dataset.path;
+  if (path) openFile(path);
 }
 
 async function previewExamSplit() {
@@ -859,6 +925,7 @@ async function runExamSplit() {
     if (!res.ok) throw new Error(data.error);
     renderSplitPlan(data); status.textContent = `✅ ${data.entries.length}명 PDF 생성 완료 · 이제 '분할 답지에서 문항·기준 생성'을 누르세요.`;
     await selectProject(currentProject.id, true);
+    await loadSubmissionStatus();
   } catch (e) { status.textContent = `❌ ${e.message}`; }
 }
 
@@ -1126,27 +1193,167 @@ async function scanMaterials() {
   populateMaterials();
   const el = document.getElementById('materialsList');
   el.innerHTML = '<div class="empty-state"><div class="icon">⏳</div><p>자료를 스캔하는 중입니다. 잠시만 기다려주세요...</p></div>';
-  const res = await fetch(`/api/projects/${currentProject.id}/materials`);
+  await loadSubmissionStatus();
+}
+
+async function loadSubmissionStatus() {
+  if (!currentProject) return;
+  const res = await fetch(`/api/projects/${currentProject.id}/submissions`);
   const data = await res.json();
-  // 스캔 데이터를 전역으로 저장 (결과 상세에서 참조)
-  window._scannedMaterials = data.participants || [];
-  if (!data.participants?.length) { el.innerHTML = '<div class="empty-state"><div class="icon">📂</div><p>학생·답안 자료가 없습니다. 위에서 폴더 또는 파일을 선택하세요.</p></div>'; return; }
-  const totalFiles = data.participants.reduce((s, p) => s + p.files.length, 0);
-  const participantUnit = currentProject.project_type === 'exam' || currentProject.setup?.participant_mode !== 'group' ? '명' : '모둠';
-  el.innerHTML = `<div style="margin-bottom:12px;display:flex;gap:16px;flex-wrap:wrap">
-      <span class="badge badge-primary">👥 ${data.total_count}${participantUnit}</span>
-      <span class="badge badge-success">📄 ${totalFiles}개 파일</span>
-      ${data.source_type === 'folder' && data.folder_path ? `<span class="badge" style="background:var(--surface2);color:var(--text2)">📁 ${esc(data.folder_path)}</span>` : ''}
-    </div>
-    <div class="table-wrap"><table><thead><tr><th style="width:30px"><input type="checkbox" id="checkAllMaterials" onclick="toggleAllMaterials(this.checked)"></th><th>번호</th><th>이름</th><th>파일 (${totalFiles}개)</th><th style="width:40px"></th></tr></thead><tbody>
-    ${data.participants.map(p => `<tr>
-      <td><input type="checkbox" class="participant-check" value="${p.number}"></td>
-      <td>${p.number}</td>
-      <td>${esc(p.name)}</td>
-      <td>${p.files.map(f => `<span class="chip" style="cursor:pointer" onclick="openFile('${esc(f.path.replace(/\\/g, '\\\\').replace(/'/g, "\\'"))}')" title="클릭하여 열기: ${esc(f.path)}">📄 ${esc(f.name)} (${f.size_mb}MB)</span>`).join(' ')}</td>
-      <td>${p.files.map(f => `<button class="btn-icon" style="font-size:.7rem" onclick="removeMaterial('${esc(f.path.replace(/\\/g, '\\\\').replace(/'/g, "\\'"))}','${esc(f.name)}')" title="${esc(f.name)} 제거">✕</button>`).join('')}</td>
-    </tr>`).join('')}
-    </tbody></table></div>`;
+  if (!res.ok) {
+    document.getElementById('materialsList').innerHTML = `<div class="empty-state"><p>${esc(data.error || '답안 연결 상태를 불러오지 못했습니다.')}</p></div>`;
+    return;
+  }
+  renderSubmissionStatus(data);
+}
+
+function renderSubmissionStatus(data) {
+  currentSubmissionStatus = data;
+  submissionFilesByIndex = [];
+  const entries = data?.entries || [];
+  const summary = data?.summary || {};
+  const summaryEl = document.getElementById('submissionSummary');
+  const listEl = document.getElementById('materialsList');
+  const rosterStatus = document.getElementById('rosterStatus');
+  const roster = data?.roster || [];
+
+  if (!currentProject.submissions) currentProject.submissions = {};
+  currentProject.submissions.students = roster;
+  if (currentProject.project_type === 'exam') currentProject.exam.students = roster;
+  if (rosterStatus && data.roster_source === 'files') {
+    rosterStatus.textContent = '파일명에서 임시 명렬을 찾았습니다. 확인 후 명렬로 저장하세요.';
+  }
+  renderSplitOutput(data?.split?.output_dir, data?.split?.exists, data?.split?.file_count || 0);
+
+  if (summaryEl) {
+    summaryEl.innerHTML = `
+      <span class="badge badge-primary">명렬 ${summary.roster_count || 0}명</span>
+      <span class="badge badge-success">연결 ${summary.ready_count || 0}명</span>
+      <span class="badge">파일 ${summary.file_count || 0}개</span>
+      ${summary.missing ? `<span class="badge badge-danger">누락 ${summary.missing}</span>` : ''}
+      ${summary.name_mismatch ? `<span class="badge badge-warning">이름 불일치 ${summary.name_mismatch}</span>` : ''}
+      ${summary.multiple_files ? `<span class="badge badge-warning">여러 파일 ${summary.multiple_files}</span>` : ''}
+      ${summary.unregistered ? `<span class="badge badge-warning">명렬 외 ${summary.unregistered}</span>` : ''}
+      ${data.all_ready ? '<strong class="inline-status success">✅ 채점 준비 완료</strong>' : ''}
+    `;
+  }
+
+  window._scannedMaterials = entries
+    .filter(entry => entry.files?.length)
+    .map(entry => ({ number: entry.number, name: entry.name || entry.discovered_name, files: entry.files }));
+
+  if (!entries.length) {
+    listEl.innerHTML = '<div class="empty-state"><div class="icon">📂</div><p>학생·답안 자료가 없습니다. 위에서 폴더 또는 파일을 선택하세요.</p></div>';
+    return;
+  }
+
+  let rows = '';
+  for (const entry of entries) {
+    let fileRows = '';
+    for (const file of (entry.files || [])) {
+      const index = submissionFilesByIndex.push({ file, entry }) - 1;
+      const manualAction = file.manual_link
+        ? `<button class="btn btn-secondary btn-sm" onclick="resetSubmissionLink(${index})">자동 연결로 되돌리기</button>`
+        : '';
+      const rosterOptions = roster.map(student =>
+        `<option value="${student.number}" ${student.number === entry.number ? 'selected' : ''}>${student.number}. ${esc(student.name || `학생 ${student.number}`)}</option>`
+      ).join('');
+      const relinkLabel = entry.status === 'name_mismatch' ? '이 학생으로 확인' : '연결 변경';
+      const relink = roster.length
+        ? `<select id="submissionTarget-${index}" class="submission-target">${rosterOptions}</select>
+           <button class="btn btn-secondary btn-sm" onclick="reassignSubmission(${index})">${relinkLabel}</button>`
+        : '';
+      fileRows += `
+        <div class="submission-file-row">
+          <button class="chip" onclick="openSubmissionFile(${index})" title="${escAttr(file.path)}">📄 ${esc(file.name)} (${file.size_mb || 0}MB)</button>
+          <div class="submission-file-actions">${relink}${manualAction}
+            <button class="btn-icon" onclick="removeSubmissionFile(${index})" title="${escAttr(file.name)} 제거">✕</button>
+          </div>
+        </div>`;
+    }
+    if (!fileRows) fileRows = '<span class="inline-status danger">연결된 파일이 없습니다.</span>';
+    const checked = entry.files?.length ? '' : 'disabled';
+    rows += `
+      <tr class="submission-row status-${entry.status}">
+        <td><input type="checkbox" class="participant-check" value="${entry.number}" ${checked}></td>
+        <td>${entry.number}</td>
+        <td><strong>${esc(entry.name || entry.discovered_name || `학생 ${entry.number}`)}</strong>
+          ${entry.discovered_name && entry.name && entry.discovered_name !== entry.name ? `<small>파일명: ${esc(entry.discovered_name)}</small>` : ''}
+        </td>
+        <td><span class="submission-status status-${entry.status}">${esc(entry.status_label)}</span></td>
+        <td><div class="submission-file-list">${fileRows}</div></td>
+      </tr>`;
+  }
+
+  const inferButton = data.roster_source === 'files'
+    ? '<div class="info-callout">파일명으로 번호와 이름을 찾았습니다. <button class="btn btn-primary btn-sm" onclick="inferRosterFromFiles()">이 명렬을 저장</button></div>'
+    : '';
+  listEl.innerHTML = `${inferButton}
+    <div class="table-wrap"><table>
+      <thead><tr><th style="width:30px"><input type="checkbox" id="checkAllMaterials" onclick="toggleAllMaterials(this.checked)"></th><th>번호</th><th>명렬 이름</th><th>상태</th><th>연결 파일</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>`;
+}
+
+async function inferRosterFromFiles() {
+  if (!currentSubmissionStatus) return;
+  const inferred = (currentSubmissionStatus.entries || [])
+    .filter(entry => entry.files?.length)
+    .map(entry => ({ number: entry.number, name: entry.name || entry.discovered_name || `학생 ${entry.number}` }));
+  if (!inferred.length) return alert('파일명에서 찾을 수 있는 학생이 없습니다.');
+  document.getElementById('rosterInput').value = inferred.map(student => `${student.number}, ${student.name}`).join('\n');
+  try {
+    await saveRoster({ requireStudents: true });
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
+function openSubmissionFile(index) {
+  const item = submissionFilesByIndex[index];
+  if (item) openFile(item.file.path);
+}
+
+async function removeSubmissionFile(index) {
+  const item = submissionFilesByIndex[index];
+  if (!item) return;
+  await removeMaterial(item.file.path, item.file.name);
+}
+
+async function reassignSubmission(index) {
+  const item = submissionFilesByIndex[index];
+  const target = document.getElementById(`submissionTarget-${index}`);
+  if (!item || !target) return;
+  const res = await fetch(`/api/projects/${currentProject.id}/submissions/link`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ file_path: item.file.path, student_number: parseInt(target.value) }),
+  });
+  const data = await res.json();
+  if (!res.ok) return alert(data.error || '연결 변경 실패');
+  renderSubmissionStatus(data.status);
+}
+
+async function resetSubmissionLink(index) {
+  const item = submissionFilesByIndex[index];
+  if (!item) return;
+  const res = await fetch(`/api/projects/${currentProject.id}/submissions/link`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ file_path: item.file.path }),
+  });
+  const data = await res.json();
+  if (!res.ok) return alert(data.error || '자동 연결 복구 실패');
+  renderSubmissionStatus(data.status);
+}
+
+async function resetSubmissionLinks() {
+  if (!currentProject) return;
+  if (!confirm('교사가 바꾼 파일 연결을 모두 지우고 파일명 기준 자동 연결로 되돌릴까요?')) return;
+  const res = await fetch(`/api/projects/${currentProject.id}/submissions/links/reset`, { method: 'POST' });
+  const data = await res.json();
+  if (!res.ok) return alert(data.error || '수동 연결 초기화 실패');
+  renderSubmissionStatus(data.status);
 }
 
 function toggleAllMaterials(checked) {
@@ -2003,6 +2210,7 @@ async function saveKeys() {
 
 // ═══ 유틸 ═══
 function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function escAttr(s) { return esc(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
 function formatDateTime(value) {
   if (!value) return '';
   const date = new Date(value);

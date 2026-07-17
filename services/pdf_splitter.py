@@ -12,7 +12,8 @@ from pypdf import PdfReader, PdfWriter
 
 from config import PROJECTS_DIR
 from models.project import (
-    ProjectConfig, ScanSplitConfig, StudentRecord, resolve_project_path, save_project,
+    ProjectConfig, ScanSplitConfig, StudentRecord, portable_project_path,
+    resolve_project_path, save_project,
 )
 
 
@@ -134,7 +135,7 @@ def split_integrated_pdf(
     )
     plan = build_split_plan(
         source_path,
-        config.exam.students,
+        config.roster_students,
         start_page=start_page,
         pages_per_student=pages_per_student,
         boundaries=boundaries,
@@ -192,6 +193,7 @@ def split_integrated_pdf(
     config.materials.source_type = "upload"
     config.materials.file_types = ["pdf"]
     config.materials.naming_pattern = r"(\d+)\.\s*(.+)"
+    config.submissions.split_output_dir = portable_project_path(config.id, final_dir)
     save_project(config)
 
     plan["output_dir"] = str(final_dir)
