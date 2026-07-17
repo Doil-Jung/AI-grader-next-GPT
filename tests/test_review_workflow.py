@@ -10,7 +10,7 @@ import services.overview as overview
 import services.pdf_splitter as splitter
 import services.review as review
 import services.submissions as submissions
-from models.project import Category, Criterion
+from models.project import Category, Criterion, ExamQuestion, StudentRecord
 
 
 def configure_temp_projects(tmp_path, monkeypatch):
@@ -181,6 +181,16 @@ def test_review_api_and_analysis_do_not_mix_manual_into_ai_average(tmp_path, mon
         },
     )
     assert approved.status_code == 200
+    summary = client.get(
+        f"/api/projects/{config.id}/analysis/summary"
+        "?rounds=1,2&include_manual=true"
+    )
+    assert summary.status_code == 200
+    summary_data = summary.get_json()
+    assert summary_data["manual_mae"] == 3
+    assert summary_data["final_mae"] == 3
+    assert summary_data["approved_count"] == 1
+    assert summary_data["items"][0]["manual_mae"] == 3
     dashboard = client.get(
         f"/api/projects/{config.id}/review?rounds=1,2"
     ).get_json()
@@ -196,7 +206,14 @@ def test_review_api_and_analysis_do_not_mix_manual_into_ai_average(tmp_path, mon
     )
     assert exported.status_code == 200
     workbook = load_workbook(io.BytesIO(exported.data), data_only=True)
-    assert workbook.sheetnames == ["종합 분석", "항목별 비교"]
+    assert workbook.sheetnames == [
+        "확정 점수표", "종합 분석", "항목별 비교", "문항별 분석"
+    ]
+    final_headers = [
+        cell.value for cell in workbook["확정 점수표"][1]
+    ]
+    assert "최종 확정 총점" in final_headers
+    assert "확정 정확성" in final_headers
     headers = [
         cell.value for cell in workbook["종합 분석"][1]
     ]
@@ -207,6 +224,70 @@ def test_review_api_and_analysis_do_not_mix_manual_into_ai_average(tmp_path, mon
     ]
     assert "AI 중앙값" in detail_headers
     assert "최종 확정" in detail_headers
+    item_headers = [
+        cell.value for cell in workbook["문항별 분석"][1]
+    ]
+    assert "AI-수동 평균 절대차" in item_headers
+
+
+def test_exam_final_sheet_contains_subquestions_and_parent_total(
+    tmp_path, monkeypatch
+):
+    projects = configure_temp_projects(tmp_path, monkeypatch)
+    config = project_model.create_project("서술형 확정표", workflow_type="exam")
+    config.exam.questions = [
+        ExamQuestion("q1", "1", "공통 지문", 10),
+        ExamQuestion(
+            "q1a", "1-(1)", "값", 4, parent_id="q1", sub_index=1
+        ),
+        ExamQuestion(
+            "q1b", "1-(2)", "유도", 6, parent_id="q1", sub_index=2
+        ),
+    ]
+    config.submissions.students = [StudentRecord(1, "학생")]
+    project_model.save_project(config)
+    grading.save_result(
+        config.id,
+        1,
+        {
+            "team_number": 1,
+            "team_name": "학생",
+            "q1a": 3,
+            "q1b": 5,
+            "total_score": 8,
+        },
+        1,
+    )
+    review.approve_final_score(
+        config,
+        1,
+        final_total_score=8,
+        item_scores={"q1a": 3, "q1b": 5},
+        teacher_note="확인",
+        decision_source="ai_suggested",
+        basis_rounds=[1],
+        participant_numbers=[1],
+    )
+    client = app_module.app.test_client()
+
+    exported = client.get(
+        f"/api/projects/{config.id}/analysis/excel?rounds=1"
+    )
+
+    assert exported.status_code == 200
+    workbook = load_workbook(io.BytesIO(exported.data), data_only=True)
+    sheet = workbook["확정 점수표"]
+    headers = [cell.value for cell in sheet[1]]
+    assert "확정 1번 합계" in headers
+    assert "확정 1-(1)번" in headers
+    assert "확정 1-(2)번" in headers
+    values = {
+        header: sheet.cell(row=2, column=index + 1).value
+        for index, header in enumerate(headers)
+    }
+    assert values["확정 1번 합계"] == 8
+    assert values["확정 1-(1)번"] == 3
+    assert values["확정 1-(2)번"] == 5
 
 
 def test_round_adjustment_preserves_original_ai_result_for_report(tmp_path, monkeypatch):

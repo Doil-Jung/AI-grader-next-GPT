@@ -72,6 +72,16 @@ from services.standardization import (
     validate_draft as validate_standardization_draft,
 )
 from services.submissions import build_submission_status
+from services.analysis import (
+    build_analysis_rows,
+    build_analysis_summary,
+    build_analysis_workbook,
+)
+from services.feedback_export import (
+    FeedbackExportError,
+    create_feedback_bundle,
+    preview_feedback_export,
+)
 
 
 app = Flask(__name__, template_folder=str(BUNDLE_DIR / "templates"), static_folder=str(BUNDLE_DIR / "static"))
@@ -3102,57 +3112,35 @@ def api_analysis(project_id):
         round_ids=round_ids,
         participant_numbers=_review_participant_numbers(config),
     )
-    results = []
-    for student in dashboard["students"]:
-        scores = {
-            f"{round_id}회": score
-            for round_id, score in student["scores_by_round"].items()
-        }
-        calc_scores = list(scores.values())
-        manual_score = student["manual_score"] if include_manual else None
-        if not calc_scores and manual_score is None:
-            continue
-        avg = student["ai_average"]
-        trimmed_avg = avg
-        is_trimmed = False
-        if len(calc_scores) >= 5:
-            trimmed_list = sorted(calc_scores)[1:-1]
-            trimmed_avg = sum(trimmed_list) / len(trimmed_list)
-            is_trimmed = True
-        results.append({
-            "team_number": student["team_number"],
-            "team_name": student["team_name"],
-            "manual_score": manual_score,
-            "scores_by_round": scores,
-            "score_count": len(calc_scores),
-            "average": round(avg, 2) if avg is not None else None,
-            "median": student["ai_median"],
-            "trimmed_average": (
-                round(trimmed_avg, 2) if trimmed_avg is not None else None
-            ),
-            "is_trimmed": is_trimmed,
-            "std_dev": student["std_dev"],
-            "ai_manual_difference": (
-                student["ai_manual_difference"] if include_manual else None
-            ),
-            "sample_comment": "",
-        })
-    results.sort(
-        key=lambda value: (
-            value["average"] is None,
-            -(value["average"] or 0),
-            value["team_number"],
-        )
+    return jsonify(build_analysis_rows(
+        dashboard,
+        include_manual=include_manual,
+    ))
+
+
+@app.route("/api/projects/<project_id>/analysis/summary")
+def api_analysis_summary(project_id):
+    """총점과 문항별 신뢰도 지표를 같은 계산 기준으로 제공한다."""
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    rounds_param = request.args.get("rounds", "")
+    include_manual = request.args.get("include_manual", "false").lower() == "true"
+    round_ids = [int(r) for r in rounds_param.split(",") if r.strip().isdigit()]
+    dashboard = build_review_dashboard(
+        config,
+        round_ids=round_ids,
+        participant_numbers=_review_participant_numbers(config),
     )
-    return jsonify(results)
+    return jsonify(build_analysis_summary(
+        dashboard,
+        include_manual=include_manual,
+    ))
 
 
 @app.route("/api/projects/<project_id>/analysis/excel")
 def api_analysis_excel(project_id):
     """AI·수동·확정 점수 계층을 분리한 분석 결과 Excel 다운로드."""
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
-    
     config = load_project(project_id)
     if not config:
         return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
@@ -3165,142 +3153,53 @@ def api_analysis_excel(project_id):
         round_ids=round_ids,
         participant_numbers=_review_participant_numbers(config),
     )
-    all_round_keys = [f"{round_id}회" for round_id in dashboard["selected_round_ids"]]
-    results = []
-    for student in dashboard["students"]:
-        scores = {
-            f"{round_id}회": score
-            for round_id, score in student["scores_by_round"].items()
-        }
-        calc_scores = list(scores.values())
-        manual = student["manual_score"] if include_manual else None
-        if not calc_scores and manual is None:
-            continue
-        trimmed_average = student["ai_average"]
-        if len(calc_scores) >= 5:
-            trimmed_list = sorted(calc_scores)[1:-1]
-            trimmed_average = round(sum(trimmed_list) / len(trimmed_list), 2)
-        latest_result = {}
-        for round_id in reversed(dashboard["selected_round_ids"]):
-            candidate = load_completed(project_id, round_id).get(
-                student["team_number"], {}
-            )
-            if candidate:
-                latest_result = candidate
-                break
-        results.append({
-            **student,
-            "scores": scores,
-            "manual_score": manual,
-            "trimmed_average": trimmed_average,
-            "overall_comment": latest_result.get("overall_comment", ""),
-            "seteuk": latest_result.get("seteuk", ""),
-        })
-    results.sort(key=lambda value: (
-        value["ai_average"] is None,
-        -(value["ai_average"] or 0),
-        value["team_number"],
-    ))
-    
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "종합 분석"
-    hfont = Font(name="맑은 고딕", bold=True, size=11, color="FFFFFF")
-    hfill = PatternFill(start_color="2B579A", end_color="2B579A", fill_type="solid")
-    dfont = Font(name="맑은 고딕", size=10)
-    ca = Alignment(horizontal="center", vertical="center")
-    bd = Border(left=Side(style="thin"), right=Side(style="thin"), top=Side(style="thin"), bottom=Side(style="thin"))
-    headers = (
-        ["순위", "번호", "이름"]
-        + all_round_keys
-        + [
-            "AI 평균", "AI 중앙값", "절사평균", "AI 표준편차",
-            "수동채점", "차이(AI-수동)", "AI 제안점수",
-            "교사 확정점수", "확정 상태", "확정 근거",
-            "검토 사유", "종합의견", "세특",
-        ]
+    wb = build_analysis_workbook(
+        config,
+        dashboard,
+        include_manual=include_manual,
+        load_completed=load_completed,
     )
-    for col, h in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col, value=h)
-        cell.font = hfont; cell.fill = hfill; cell.alignment = ca; cell.border = bd
-    for rank, r in enumerate(results, 1):
-        manual = r.get("manual_score")
-        decision = r.get("decision") or {}
-        vals = [rank, r["team_number"], r["team_name"]]
-        for rk in all_round_keys:
-            vals.append(r["scores"].get(rk, ""))
-        vals += [
-            r["ai_average"] if r["ai_average"] is not None else "",
-            r["ai_median"] if r["ai_median"] is not None else "",
-            r["trimmed_average"] if r["trimmed_average"] is not None else "",
-            r["std_dev"],
-            manual if manual is not None else "",
-            r["ai_manual_difference"] if manual is not None else "",
-            r["ai_suggested_score"] if r["ai_suggested_score"] is not None else "",
-            decision.get("total_score", ""),
-            "확정" if decision.get("status") == "approved" else "대기",
-            decision.get("decision_source", ""),
-            " · ".join(reason["label"] for reason in r["review_reasons"]),
-            r.get("overall_comment", ""),
-            r.get("seteuk", ""),
-        ]
-        row = rank + 1
-        for col, val in enumerate(vals, 1):
-            cell = ws.cell(row=row, column=col, value=val)
-            cell.font = dfont; cell.alignment = ca; cell.border = bd
-
-    detail_ws = wb.create_sheet("항목별 비교")
-    detail_headers = (
-        ["번호", "이름", "항목·문항", "배점"]
-        + all_round_keys
-        + [
-            "AI 평균", "AI 중앙값", "표준편차",
-            "수동 점수", "차이(AI-수동)", "최종 확정",
-        ]
-    )
-    for col, header in enumerate(detail_headers, 1):
-        cell = detail_ws.cell(row=1, column=col, value=header)
-        cell.font = hfont
-        cell.fill = hfill
-        cell.alignment = ca
-        cell.border = bd
-    detail_row = 2
-    for result in results:
-        for item in result.get("items", []):
-            values = [
-                result["team_number"],
-                result["team_name"],
-                item["label"],
-                item["max_score"],
-            ]
-            for round_key in all_round_keys:
-                round_id = int(round_key[:-1])
-                values.append(item["scores_by_round"].get(round_id, ""))
-            values += [
-                item["ai_average"] if item["ai_average"] is not None else "",
-                item["ai_median"] if item["ai_median"] is not None else "",
-                item["std_dev"],
-                item["manual_score"] if include_manual and item["manual_score"] is not None else "",
-                (
-                    item["ai_manual_difference"]
-                    if include_manual and item["ai_manual_difference"] is not None
-                    else ""
-                ),
-                item["final_score"] if item["final_score"] is not None else "",
-            ]
-            for col, value in enumerate(values, 1):
-                cell = detail_ws.cell(row=detail_row, column=col, value=value)
-                cell.font = dfont
-                cell.alignment = ca
-                cell.border = bd
-            detail_row += 1
-    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = PROJECTS_DIR / project_id / "results" / f"종합분석_{timestamp}.xlsx"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
     return send_file(output_path, as_attachment=True, download_name=f"종합분석_{timestamp}.xlsx",
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+@app.route("/api/projects/<project_id>/feedback-export/preview")
+def api_feedback_export_preview(project_id):
+    """추가 입력 없이 만들 수 있는 익명 피드백 묶음의 범위를 보여준다."""
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    try:
+        return jsonify(preview_feedback_export(config))
+    except (OSError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/projects/<project_id>/feedback-export", methods=["POST"])
+def api_feedback_export(project_id):
+    """원본을 제외한 익명 개발 피드백 ZIP을 생성하고 내려받는다."""
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    try:
+        output_path, metadata = create_feedback_bundle(config)
+    except FeedbackExportError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except (OSError, ValueError) as exc:
+        return jsonify({"error": f"피드백 묶음을 만들지 못했습니다: {exc}"}), 400
+    response = send_file(
+        output_path,
+        as_attachment=True,
+        download_name=output_path.name,
+        mimetype="application/zip",
+    )
+    response.headers["X-AI-Grader-Export-ID"] = metadata["export_id"]
+    response.headers["X-AI-Grader-Mapping-Saved"] = "true"
+    return response
 
 
 

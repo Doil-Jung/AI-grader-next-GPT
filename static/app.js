@@ -47,6 +47,7 @@ function showTab(name) {
   }
   if (name === 'analysis') {
     loadRoundsForAnalysis();
+    loadFeedbackExportPreview();
     if (currentProject?.workflow_type === 'competition') loadRounds('subRound', () => loadSubmission());
   }
   if (name === 'materials') scanMaterials();
@@ -3220,34 +3221,69 @@ async function runAnalysis() {
   const includeManual = document.getElementById('includeManual').checked;
   
   if (!rounds && !includeManual) return alert('분석할 회차를 선택하거나 수동 채점을 포함하세요.');
-  
-  const res = await fetch(`/api/projects/${currentProject.id}/analysis?rounds=${rounds}&include_manual=${includeManual}`);
-  const results = await res.json();
-  
-  if (!results.length) {
-    document.getElementById('analysisBody').innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--text2)">데이터 없음</td></tr>';
-    return;
+
+  const query = `rounds=${encodeURIComponent(rounds)}&include_manual=${includeManual}`;
+  try {
+    const [resultResponse, summaryResponse] = await Promise.all([
+      fetch(`/api/projects/${currentProject.id}/analysis?${query}`),
+      fetch(`/api/projects/${currentProject.id}/analysis/summary?${query}`),
+    ]);
+    const results = await resultResponse.json();
+    const summary = await summaryResponse.json();
+    if (!resultResponse.ok) throw new Error(results.error || '분석 결과를 만들지 못했습니다.');
+    if (!summaryResponse.ok) throw new Error(summary.error || '문항별 분석을 만들지 못했습니다.');
+
+    document.getElementById('analysisSummaryCards').style.display = 'grid';
+    document.getElementById('analysisStudentCount').textContent = summary.student_count || 0;
+    document.getElementById('analysisRoundCount').textContent = summary.round_count || 0;
+    document.getElementById('analysisManualMae').textContent = summary.manual_mae == null
+      ? '측정 불가'
+      : reviewScore(summary.manual_mae);
+    document.getElementById('analysisApprovedCount').textContent = summary.approved_count || 0;
+    document.getElementById('analysisAttentionCount').textContent = summary.attention_count || 0;
+
+    if (!results.length) {
+      document.getElementById('analysisHead').innerHTML = '<th>분석 결과</th>';
+      document.getElementById('analysisBody').innerHTML = '<tr><td style="text-align:center;color:var(--text2)">데이터 없음</td></tr>';
+    } else {
+      const roundIds = [...new Set(results.flatMap(r => Object.keys(r.scores_by_round || {})))];
+      let headHtml = '<th>순위</th><th>번호</th><th>이름</th>';
+      roundIds.forEach(rid => headHtml += `<th>${esc(rid)}</th>`);
+      headHtml += '<th>수동</th><th>AI 평균</th><th>절사평균</th><th>편차</th><th>AI-수동</th><th>AI 제안</th><th>최종 확정</th><th>상태</th><th>검토 사유</th>';
+      document.getElementById('analysisHead').innerHTML = headHtml;
+
+      document.getElementById('analysisBody').innerHTML = results.map((row, index) => {
+        let html = `<tr><td>${index + 1}</td><td>${row.team_number}</td><td>${esc(row.team_name || '')}</td>`;
+        roundIds.forEach(roundId => html += `<td>${reviewScore(row.scores_by_round?.[roundId])}</td>`);
+        const difference = row.ai_manual_difference;
+        const reasons = (row.review_reasons || []).map(reason => reason.label).join(' · ');
+        const status = row.final_status === 'approved'
+          ? `<span class="badge badge-success">최종 확정</span>${row.decision_stale ? '<br><span class="badge badge-danger">자료 변경</span>' : ''}`
+          : '<span class="badge badge-warning">확정 대기</span>';
+        html += `<td>${reviewScore(row.manual_score)}</td><td><strong>${reviewScore(row.average)}</strong></td>`;
+        html += `<td>${row.is_trimmed ? reviewScore(row.trimmed_average) : '-'}</td>`;
+        html += `<td>${reviewScore(row.std_dev)}</td>`;
+        html += `<td>${difference == null ? '-' : `${difference > 0 ? '+' : ''}${reviewScore(difference)}`}</td>`;
+        html += `<td>${reviewScore(row.ai_suggested_score)}</td><td><strong>${reviewScore(row.final_score)}</strong></td>`;
+        html += `<td>${status}</td><td title="${esc(reasons)}">${esc(reasons || '-')}</td></tr>`;
+        return html;
+      }).join('');
+    }
+
+    const itemSection = document.getElementById('analysisItemSection');
+    itemSection.style.display = summary.items?.length ? 'block' : 'none';
+    document.getElementById('analysisItemBody').innerHTML = (summary.items || []).map(item => `
+      <tr>
+        <td>${esc(item.label || '')}</td><td>${reviewScore(item.max_score)}</td>
+        <td>${item.student_count}</td><td>${reviewScore(item.ai_average)}</td>
+        <td>${reviewScore(item.average_std_dev)}</td><td>${item.manual_count}</td>
+        <td>${item.manual_mae == null ? '측정 불가' : reviewScore(item.manual_mae)}</td>
+        <td>${item.final_count}</td><td>${item.final_mae == null ? '측정 불가' : reviewScore(item.final_mae)}</td>
+      </tr>`).join('');
+  } catch (error) {
+    document.getElementById('analysisHead').innerHTML = '<th>분석 오류</th>';
+    document.getElementById('analysisBody').innerHTML = `<tr><td class="criteria-error">${esc(error.message)}</td></tr>`;
   }
-  
-  // 동적 헤더 생성
-  const roundIds = [...new Set(results.flatMap(r => Object.keys(r.scores_by_round || {})))];
-  let headHtml = '<th>순위</th><th>번호</th><th>이름</th>';
-  roundIds.forEach(rid => headHtml += `<th>${esc(rid)}</th>`);
-  headHtml += '<th>수동</th><th>평균</th><th>절사평균</th><th>편차</th><th>차이(AI-수동)</th>';
-  document.getElementById('analysisHead').innerHTML = headHtml;
-  
-  // 데이터 행
-  const tbody = document.getElementById('analysisBody');
-  tbody.innerHTML = results.map((r, i) => {
-    let html = `<tr><td>${i + 1}</td><td>${r.team_number}</td><td>${esc(r.team_name || '')}</td>`;
-    roundIds.forEach(rid => html += `<td>${r.scores_by_round?.[rid] ?? '-'}</td>`);
-    const manual = r.manual_score != null ? r.manual_score : '-';
-    const diff = r.ai_manual_difference != null ? Number(r.ai_manual_difference).toFixed(1) : '-';
-    html += `<td>${manual}</td><td><strong>${reviewScore(r.average)}</strong></td>`;
-    html += `<td>${r.is_trimmed ? reviewScore(r.trimmed_average) : '-'}</td>`;
-    html += `<td>${reviewScore(r.std_dev)}</td><td>${diff}</td></tr>`;
-    return html;
-  }).join('');
 }
 
 async function downloadAnalysisExcel() {
@@ -3256,6 +3292,71 @@ async function downloadAnalysisExcel() {
   const rounds = Array.from(checks).map(c => c.value).join(',');
   const includeManual = document.getElementById('includeManual').checked;
   window.location.href = `/api/projects/${currentProject.id}/analysis/excel?rounds=${rounds}&include_manual=${includeManual}`;
+}
+
+async function loadFeedbackExportPreview() {
+  if (!currentProject) return;
+  const preview = document.getElementById('feedbackExportPreview');
+  if (!preview) return;
+  preview.textContent = '내보낼 범위를 확인하는 중입니다.';
+  try {
+    const response = await fetch(`/api/projects/${currentProject.id}/feedback-export/preview`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || '내보낼 범위를 확인하지 못했습니다.');
+    preview.innerHTML = [
+      `<strong>가상 학생 ${data.student_count}명 · 채점 ${data.round_count}회차 · 성능 레코드 ${data.record_count}건</strong>`,
+      `수동 비교 ${esc(data.manual_measurement)} · 최종 확정 비교 ${esc(data.final_measurement)}`,
+      `자료 ${data.material_count}개는 형식·크기만 기록하고 원본 ${data.excluded_original_count}개는 모두 제외합니다.`,
+      '실제↔가상 학생 대응표는 ZIP에 넣지 않고 이 프로젝트의 private/feedback_mappings에만 저장합니다.',
+    ].join('<br>');
+  } catch (error) {
+    preview.innerHTML = `<span class="criteria-error">${esc(error.message)}</span>`;
+  }
+}
+
+async function downloadFeedbackExport() {
+  if (!currentProject) return;
+  const confirmed = confirm(
+    '익명 개발 피드백 ZIP을 만들까요?\n\n' +
+    '학생 답안·문제지·정답지·루브릭 원본은 포함하지 않습니다.\n' +
+    '실제 학생 대응표는 이 컴퓨터의 프로젝트 private 폴더에만 저장됩니다.'
+  );
+  if (!confirmed) return;
+  const button = document.getElementById('feedbackExportButton');
+  const status = document.getElementById('feedbackExportStatus');
+  button.disabled = true;
+  status.className = 'inline-status';
+  status.textContent = '익명화·개인정보 검사를 진행하는 중입니다.';
+  try {
+    const response = await fetch(`/api/projects/${currentProject.id}/feedback-export`, {
+      method: 'POST',
+    });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.error || '피드백 묶음을 만들지 못했습니다.');
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get('content-disposition') || '';
+    const utf8Name = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+    const plainName = disposition.match(/filename="?([^";]+)"?/i);
+    const filename = utf8Name
+      ? decodeURIComponent(utf8Name[1])
+      : (plainName?.[1] || '개발용_성능자료.zip');
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    const exportId = response.headers.get('X-AI-Grader-Export-ID') || '';
+    status.className = 'inline-status success';
+    status.textContent = `완료${exportId ? ` · ${exportId}` : ''} · 로컬 대응표 별도 저장`;
+  } catch (error) {
+    status.className = 'inline-status danger';
+    status.textContent = `실패: ${error.message}`;
+  } finally {
+    button.disabled = false;
+  }
 }
 
 // ═══ 제출용 ═══
