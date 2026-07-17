@@ -1,0 +1,27 @@
+# API 키 (절대 커밋 금지)
+.api_keys.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.spec
+!AI_Grader.spec
+
+# 프로젝트 데이터 (개인 채점 결과)
+projects/
+output/
+temp/
+
+# 기타
+.DS_Store
+Thumbs.db
+*.log
+browser_profiles/
+tmp/
+_to_delete/
+.test_deps/
+.pytest_cache/

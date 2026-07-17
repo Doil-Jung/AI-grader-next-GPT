@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI 채점 시스템</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+<header>
+  <div><h1>🎯 AI 채점 시스템</h1><div class="subtitle" id="headerProject">프로젝트를 선택하세요</div></div>
+  <div style="display:flex;gap:8px">
+    <button class="btn btn-secondary btn-sm" onclick="showTab('projects')">📁 프로젝트</button>
+    <button class="btn btn-secondary btn-sm" onclick="openKeyModal()">🔑 API 키</button>
+  </div>
+</header>
+
+<nav class="tabs" id="mainTabs">
+  <button class="tab active" data-tab="projects" onclick="showTab('projects')">📁 프로젝트</button>
+  <button class="tab" data-tab="settings" onclick="showTab('settings')">⚙️ 설정</button>
+  <button class="tab" data-tab="exam" id="examTabButton" onclick="showTab('exam')" style="display:none">📝 서술형 시험</button>
+  <button class="tab" data-tab="materials" onclick="showTab('materials')">📂 심사자료</button>
+  <button class="tab" data-tab="grading" onclick="showTab('grading')">▶️ 채점</button>
+  <button class="tab" data-tab="results" onclick="showTab('results')">📊 결과</button>
+  <button class="tab" data-tab="submission" id="submissionTabButton" onclick="showTab('submission')">📝 제출용</button>
+</nav>
+
+<!-- 프로젝트 탭 -->
+<div class="tab-content active" id="tab-projects">
+  <div class="card">
+    <h2>📁 프로젝트 관리</h2>
+    <button class="btn btn-primary" onclick="openNewProjectModal()" style="margin-bottom:16px">+ 새 프로젝트</button>
+    <div id="projectList" class="project-list"></div>
+  </div>
+</div>
+
+<!-- 설정 탭 -->
+<div class="tab-content" id="tab-settings">
+  <div class="card">
+    <h2>⚙️ 프로젝트 설정</h2>
+    <div class="form-row">
+      <div class="form-group"><label>프로젝트 이름</label><input id="cfgName" placeholder="프로젝트 이름"></div>
+      <div class="form-group"><label>프로젝트 유형</label><select id="cfgProjectType" onchange="changeProjectType(this.value)"><option value="report">보고서 평가</option><option value="exam">정기고사 서술형</option></select></div>
+      <div class="form-group"><label>AI 실행 방식</label><select id="cfgProvider" onchange="updateProviderUI()"></select></div>
+      <div class="form-group"><label>AI 모델</label><select id="cfgModel"></select></div>
+      <div class="form-group"><label>Temperature</label><input id="cfgTemp" type="number" min="0" max="1" step="0.1" value="0.2"></div>
+    </div>
+    <div class="form-group"><label>설명</label><textarea id="cfgDesc" rows="2"></textarea></div>
+  </div>
+
+
+  <div class="card" id="reportRubricCard">
+    <h2>📏 채점 기준 (Rubric)</h2>
+
+    <!-- 방법 1: 텍스트로 AI 생성 -->
+    <div style="margin-bottom:20px;padding:16px;background:var(--surface2);border-radius:10px">
+      <h3 style="margin:0 0 8px;font-size:.95rem">💬 방법 1. 텍스트로 루브릭 생성 (AI)</h3>
+      <textarea id="rubricTextInput" rows="3" placeholder="예: 3개 영역(탐구, 실험, 조사), 각 영역에 세부항목 2개(과정, 보고서). 10점 만점 항목은 10,8,6 급간, 5점 만점 항목은 5,4,3 급간으로 해줘." style="width:100%;font-size:.85rem;margin-bottom:8px"></textarea>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn btn-success btn-sm" onclick="generateRubricFromText()">🤖 AI로 루브릭 생성</button>
+        <span id="rubricGenStatus" style="font-size:.8rem;color:var(--text2)"></span>
+      </div>
+    </div>
+
+    <!-- 방법 2: 파일에서 AI 추출 -->
+    <div style="margin-bottom:20px;padding:16px;background:var(--surface2);border-radius:10px">
+      <h3 style="margin:0 0 8px;font-size:.95rem">📄 방법 2. 파일에서 루브릭 추출 (AI)</h3>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn btn-primary btn-sm" onclick="document.getElementById('rubricFileInput').click()">📄 파일 선택 및 추출</button>
+        <input type="file" id="rubricFileInput" accept=".pdf,.hwp,.hwpx,.docx,.txt" style="display:none" onchange="extractRubricFromFile(this)">
+        <span style="font-size:.8rem;color:var(--text2)">PDF, HWP, DOCX, TXT 지원</span>
+        <span id="rubricExtractStatus" style="font-size:.8rem;color:var(--text2)"></span>
+      </div>
+    </div>
+
+    <!-- 방법 3: 수동 입력 + 루브릭 에디터 -->
+    <div style="margin-bottom:12px;padding:16px;background:var(--surface2);border-radius:10px">
+      <h3 style="margin:0 0 8px;font-size:.95rem">✏️ 방법 3. 수동 입력 / 편집</h3>
+      <div id="rubricEditor"></div>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn btn-secondary btn-sm" onclick="addCategory()">+ 영역 추가</button>
+        <button class="btn btn-secondary btn-sm" onclick="generatePromptFromRubric()">🔄 현재 루브릭으로 프롬프트 생성</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" id="reportPromptCard">
+    <h2>📝 평가 프롬프트</h2>
+    <p style="font-size:.8rem;color:var(--text2);margin:0 0 8px">루브릭 생성 시 자동으로 만들어집니다. 아래에서 직접 수정하거나 채점 관점을 추가할 수 있습니다.</p>
+    <textarea id="cfgPrompt" rows="10" style="width:100%;font-size:.85rem"></textarea>
+  </div>
+
+  <div style="display:flex;gap:8px;justify-content:flex-end">
+    <button class="btn btn-primary" onclick="saveSettings()">💾 설정 저장</button>
+  </div>
+</div>
+
+<!-- 서술형 시험 탭 -->
+<div class="tab-content" id="tab-exam">
+  <div class="card">
+    <h2>① 문제지와 채점기준 준비</h2>
+    <p style="font-size:.85rem;color:var(--text2);line-height:1.6">문제지만 올려도 되고, 같은 문제가 반복되는 여러 학생의 문제·답안 통합 스캔이나 답안만 있는 자료도 사용할 수 있습니다. 공식 채점기준표가 없으면 모범답안과 부분점 초안을 생성합니다.</p>
+    <div class="form-row">
+      <div class="form-group"><label>문제지 또는 문제·답안 자료</label><input type="file" id="examQuestionFile" accept=".pdf,.hwp,.hwpx,.doc,.docx,.txt"></div>
+      <div class="form-group"><label>공식 채점기준표 (선택 즉시 추출·적용)</label><input type="file" id="examRubricFile" accept=".pdf,.hwp,.hwpx,.doc,.docx,.txt" onchange="extractExamRubricFromFile(this)"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>문제 자료 유형</label>
+        <select id="examSourceMode">
+          <option value="auto">자동 판별</option>
+          <option value="question_only">문제지만 있음</option>
+          <option value="combined_answers">문제와 여러 학생 답안이 함께 있음</option>
+          <option value="answers_only">답안 위주로 문제를 추정해야 함</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>예상 대문항 수 (모르면 0)</label>
+        <input type="number" id="examExpectedQuestionCount" min="0" value="0">
+      </div>
+    </div>
+    <p style="font-size:.78rem;color:var(--text2);margin:-4px 0 10px">예상 문항 수를 입력하면 추출 결과와 대조하고, 누락 번호가 의심되면 자동으로 한 번 더 검사합니다.</p>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <button class="btn btn-primary" onclick="uploadExamSources()">파일 저장</button>
+      <button class="btn btn-success" onclick="generateExamRubric()">🤖 공식 기준표가 없을 때 초안 생성</button>
+      <span id="examSourceStatus" style="font-size:.85rem;color:var(--text2)"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+      <h2>② 문항별 채점기준 검토</h2>
+      <button class="btn btn-secondary btn-sm" onclick="addExamQuestion()">+ 문항 추가</button>
+    </div>
+    <div style="margin:10px 0;padding:12px;background:var(--surface2);border-radius:10px">
+      <h3 style="margin:0 0 8px;font-size:.95rem">⚖️ 채점 방식 - AI에게 전달할 기준의 양</h3>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <select id="examGradingMode" onchange="updateExamGradingMode(this.value)" style="max-width:420px">
+          <option value="autonomous">자율 선채점 - 문제·정답·배점만 전달 (기준 확정 전 권장)</option>
+          <option value="core">핵심 기준 채점 - 핵심 확인 요소만 전달 (기준 확정 후 권장)</option>
+          <option value="strict">공식 기준 엄격 적용 - 상세 기준 전체 전달</option>
+        </select>
+        <button class="btn btn-secondary btn-sm" onclick="compressCriteria()">🗜 상세 기준 → 핵심 기준 압축</button>
+        <span id="examModeStatus" style="font-size:.8rem;color:var(--text2)"></span>
+      </div>
+      <p style="font-size:.78rem;color:var(--text2);margin:8px 0 0">상세 기준(부분점·인정답안·감점례)은 어떤 방식에서도 교사 검토용으로 저장됩니다. 지나치게 자세한 기준은 채점을 경직시킬 수 있어, 확정된 기준은 압축해서 '핵심 기준 채점'으로 쓰는 것을 권장합니다. 방식 변경은 "문항 저장"을 누르면 적용됩니다.</p>
+    </div>
+
+    <div style="margin:10px 0;padding:12px;background:var(--surface2);border-radius:10px">
+      <h3 style="margin:0 0 8px;font-size:.95rem">💬 텍스트로 문항 생성·수정 (AI)</h3>
+      <textarea id="examRubricTextInput" rows="3" placeholder="문항이 없을 때: 문제를 붙여넣거나 '7문항, 배점 5·5·10·10·5·5·10, 문항마다 모범답안과 부분점 2~3개' 처럼 설명 · 문항이 있을 때: '부분점을 모두 2단계로 단순화', '3번은 식 세우기 4점, 계산 3점, 단위 1점으로' 같은 수정 지시" style="width:100%;font-size:.85rem;margin-bottom:8px"></textarea>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn btn-success btn-sm" onclick="examRubricFromText()">🤖 AI로 생성/수정</button>
+        <span id="examRubricTextStatus" style="font-size:.8rem;color:var(--text2)"></span>
+      </div>
+    </div>
+    <p style="font-size:.8rem;color:var(--text2)">AI가 만든 내용은 초안입니다. 채점 전에 모범답안과 부분점 합계를 확인하세요.</p>
+    <div id="examQuestionEditor"></div>
+    <div class="form-group" style="margin-top:14px">
+      <label>교사 추가 채점 지침</label>
+      <textarea id="examAdditionalInstructions" rows="4" placeholder="공식 기준표에 덧붙여 적용할 사항을 입력하세요. 예: 단위 누락은 1점 감점, 동치인 식은 정답 인정"></textarea>
+      <p style="font-size:.78rem;color:var(--text2);margin:5px 0 0">공식 기준표를 우선하며, 이 내용은 실제 채점 프롬프트의 ‘교사 추가 채점 지침’에 포함됩니다.</p>
+    </div>
+    <div style="text-align:right;margin-top:12px"><button class="btn btn-primary" onclick="saveSettings()">💾 문항 저장</button></div>
+  </div>
+
+  <div class="card" id="rubricSynthesisCard">
+    <h2>📊 채점 결과 종합 → 기준안 만들기</h2>
+    <p style="font-size:.85rem;color:var(--text2);line-height:1.6">채점 기준을 먼저 정하지 않고 문제·정답만으로 전체 채점을 끝낸 뒤, 실제 채점 결과(문항별 점수·답안 요약·근거)를 종합해 채점 기준안, 예시답안, 정답 인정 답안, 감점 사례 초안을 만듭니다. 검토 후 문항 설정에 반영하고 저장하면, 그 기준으로 새 회차 재채점을 할 수 있습니다.</p>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <button class="btn btn-primary" onclick="synthesizeRubricFromResults()">채점 결과 종합하기</button>
+      <button class="btn btn-success" id="applySynthesisBtn" style="display:none" onclick="applyRubricSynthesis()">문항 설정에 반영</button>
+      <span id="rubricSynthesisStatus" style="font-size:.85rem;color:var(--text2)"></span>
+    </div>
+    <div id="rubricSynthesisPreview" style="margin-top:12px"></div>
+  </div>
+
+</div>
+
+<!-- 심사자료 탭 -->
+<div class="tab-content" id="tab-materials">
+  <div class="card" id="examIntegratedMaterialsCard" style="display:none">
+    <h2>📝 학생 명렬과 통합 스캔</h2>
+    <p style="font-size:.82rem;color:var(--text2);line-height:1.6">한 반 통합 PDF를 학생별 답지로 나눕니다. 분할 뒤에는 짧은 학생 답지들을 이용해 전체 문항과 채점기준을 복원할 수 있습니다.</p>
+    <div class="form-row">
+      <div class="form-group" style="flex:1.2">
+        <label>학생 명렬 - 스캔 순서대로 한 줄에 한 명</label>
+        <textarea id="examStudents" rows="8" placeholder="1, 홍길동&#10;2, 김과학&#10;3, 이탐구"></textarea>
+      </div>
+      <div class="form-group" style="flex:1">
+        <label>한 반 통합 스캔 PDF</label>
+        <input type="file" id="examScanFile" accept=".pdf">
+        <button class="btn btn-primary btn-sm" onclick="uploadExamScan()" style="margin-top:8px">통합 PDF 저장</button>
+        <div id="examScanStatus" style="font-size:.8rem;color:var(--text2);margin-top:6px"></div>
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>첫 학생 시작 쪽</label><input id="examStartPage" type="number" min="1" value="1"></div>
+      <div class="form-group"><label>학생당 쪽 수 (0=자동 계산)</label><input id="examPagesPerStudent" type="number" min="0" value="0"></div>
+      <div class="form-group" style="flex:2"><label>학생별 시작 쪽 (가변일 때, 콤마 구분)</label><input id="examBoundaries" placeholder="예: 1,5,9,14"></div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <button class="btn btn-secondary" onclick="previewExamSplit()">분할 미리보기</button>
+      <button class="btn btn-success" onclick="runExamSplit()">확인 후 학생별 PDF 생성</button>
+      <button class="btn btn-primary" onclick="generateExamRubricFromSplit()">분할 답지에서 문항·기준 생성</button>
+      <span id="examSplitStatus" style="font-size:.85rem;color:var(--text2)"></span>
+    </div>
+    <div id="examSplitPreview" style="margin-top:16px"></div>
+  </div>
+
+  <div class="card">
+    <h2>📂 심사자료</h2>
+    <input type="hidden" id="matSource" value="folder">
+    <div style="display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+      <button class="btn btn-primary" onclick="browseFolder()" id="btnBrowseFolder" style="display:flex;align-items:center;gap:6px;padding:10px 20px;font-size:.95rem;white-space:nowrap">
+        <span style="font-size:1.2em">📂</span> 폴더 선택
+      </button>
+      <div class="form-group" style="flex:1;min-width:200px;margin:0"><label style="font-size:.8rem;margin-bottom:4px">현재 선택 폴더</label><input id="matFolder" placeholder="폴더를 선택하세요..." style="width:100%" readonly></div>
+    </div>
+    <div style="margin-bottom:16px">
+      <button class="btn btn-secondary btn-sm" onclick="addFiles()" id="btnAddFiles" style="display:flex;align-items:center;gap:6px">
+        <span style="font-size:1.1em">📄</span> 파일 추가
+      </button>
+      <div id="addFilesStatus" style="font-size:.8rem;color:var(--text2);margin-top:4px"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>파일 타입 (콤마 구분)</label><input id="matTypes" value="pdf,mp4"></div>
+      <div class="form-group"><label>파일명 패턴 (정규식)</label><input id="matPattern" value="(\d+)\.\s*(.+)"></div>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;align-items:center">
+      <button class="btn btn-primary btn-sm" onclick="saveMaterials()">💾 설정저장 및 스캔</button>
+      <button class="btn btn-success btn-sm" onclick="startSelectedGrading()">▶️ 선택 채점</button>
+      <button class="btn btn-secondary btn-sm" onclick="convertHwp()" id="btnConvertHwp" style="display:flex;align-items:center;gap:6px">
+        <span style="font-size:1.1em">🔄</span> 문서 → PDF 변환
+      </button>
+      <span id="hwpConvertStatus" style="font-size:.8rem;color:var(--text2)"></span>
+    </div>
+    <div id="materialsList"></div>
+  </div>
+</div>
+
+<!-- 채점 탭 -->
+<div class="tab-content" id="tab-grading">
+  <div class="card">
+    <h2>▶️ AI 채점 실행</h2>
+    <div class="stats-grid" id="gradingStats">
+      <div class="stat-card"><div class="value" id="statTotal">0</div><div class="label">전체</div></div>
+      <div class="stat-card"><div class="value" id="statDone">0</div><div class="label">완료</div></div>
+      <div class="stat-card"><div class="value" id="statSuccess">0</div><div class="label">성공</div></div>
+      <div class="stat-card"><div class="value" id="statFail">0</div><div class="label">실패</div></div>
+    </div>
+    <div class="progress-bar" style="margin-bottom:16px"><div class="fill" id="gradingProgress" style="width:0%"></div></div>
+    <div class="form-row" style="margin-bottom:16px">
+      <div class="form-group"><label>시작 번호</label><input id="startFrom" type="number" value="1" min="1"></div>
+      <div class="form-group"><label>대기(초)</label><input id="delay" type="number" value="5" min="1"></div>
+      <div class="form-group"><label>반복 횟수</label><input id="repeatCount" type="number" value="1" min="1"></div>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:16px">
+      <button class="btn btn-success" id="btnStart" onclick="startGrading()">▶️ 채점 시작</button>
+      <button class="btn btn-danger" id="btnStop" onclick="stopGrading()" disabled>⏹ 중단</button>
+      <label style="display:flex;align-items:center;gap:6px;font-size:.85rem"><input type="checkbox" id="newRound" checked> 새 회차 (권장)</label>
+      <span id="gradingCurrentStatus" style="font-size:.82rem;color:var(--text2);align-self:center"></span>
+    </div>
+    <div class="log-box" id="gradingLog" style="margin-bottom:16px"></div>
+    <div class="team-grid" id="gradingTeamGrid"></div>
+  </div>
+</div>
+
+<!-- 결과 탭 -->
+<div class="tab-content" id="tab-results">
+  <div class="card">
+    <h2>📊 회차별 채점 결과</h2>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:16px;flex-wrap:wrap">
+      <select id="resultRound" onchange="loadResults()"></select>
+      <button class="btn btn-secondary btn-sm" onclick="loadResults()">🔄 새로고침</button>
+      <button class="btn btn-primary btn-sm" onclick="downloadResults()">📥 Excel 다운로드</button>
+    </div>
+    <div class="table-wrap"><table id="resultsTable"><thead><tr><th style="cursor:pointer;user-select:none" onclick="sortResults('rank')" id="thRank">순위 <span class="sort-arrows">▲▼</span></th><th style="cursor:pointer;user-select:none" onclick="sortResults('number')" id="thNumber">번호 <span class="sort-arrows">▲▼</span></th><th>이름</th><th>총점</th><th id="thApproval" style="display:none">승인</th><th>상세</th></tr></thead><tbody id="resultsBody"></tbody></table></div>
+  </div>
+
+  <div class="card">
+    <h2>📈 종합 분석 (다회차 평균 / 수동 채점 비교)</h2>
+    <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start;margin-bottom:16px">
+      <div>
+        <label style="font-size:.85rem;font-weight:600;margin-bottom:6px;display:block">분석할 회차 선택</label>
+        <div id="analysisRoundChecks" style="display:flex;gap:8px;flex-wrap:wrap"></div>
+      </div>
+      <div>
+        <label style="font-size:.85rem;font-weight:600;margin-bottom:6px;display:block">수동 채점</label>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="btn btn-secondary btn-sm" onclick="document.getElementById('manualFileInput').click()">📋 Excel 업로드</button>
+          <input type="file" id="manualFileInput" accept=".xlsx,.xls,.csv" style="display:none" onchange="uploadManualScores(this)">
+          <label style="display:flex;align-items:center;gap:4px;font-size:.8rem"><input type="checkbox" id="includeManual"> 평균에 포함</label>
+          <span id="manualStatus" style="font-size:.8rem;color:var(--text2)"></span>
+        </div>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:16px">
+      <button class="btn btn-primary btn-sm" onclick="runAnalysis()">📊 분석 실행</button>
+      <button class="btn btn-success btn-sm" onclick="downloadAnalysisExcel()">📥 분석 Excel 다운로드</button>
+    </div>
+    <div class="table-wrap"><table id="analysisTable"><thead><tr id="analysisHead"></tr></thead><tbody id="analysisBody"></tbody></table></div>
+  </div>
+</div>
+
+<!-- 제출용 탭 -->
+<div class="tab-content" id="tab-submission">
+  <div class="card">
+    <h2>📝 제출용 채점표</h2>
+    <p style="color:var(--text2);font-size:.85rem;margin-bottom:16px">
+      ① 팀을 불러온 후 드래그로 순위 배치 → ② 필요 시 점수 직접 입력 → ③ 미리보기로 확인 → ④ Excel 다운로드
+    </p>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:16px">
+      <select id="subRound" onchange="loadSubmission()"></select>
+      <button class="btn btn-secondary btn-sm" onclick="loadSubmission()">결과 불러오기</button>
+      <button class="btn btn-secondary btn-sm" onclick="loadAllTeamsSubmission()">전체 팀 불러오기(수동)</button>
+      <button class="btn btn-primary btn-sm" onclick="previewSubmission()">📋 채점표 생성 (미리보기)</button>
+      <button class="btn btn-success btn-sm" id="btnExportExcel" onclick="exportSubmissionExcel()" disabled>📥 Excel 다운로드</button>
+    </div>
+    <div class="table-wrap"><table><thead><tr><th style="width:40px"></th><th>순위</th><th>번호</th><th>이름</th><th>총점</th><th>점수 조정</th></tr></thead><tbody id="submissionBody"></tbody></table></div>
+    <div id="submissionPreview" style="margin-top:24px"></div>
+  </div>
+</div>
+
+<!-- 모달: API키 -->
+<div class="modal-overlay" id="keyModal">
+  <div class="modal">
+    <div class="modal-header"><h2>🔑 API 키 설정</h2><button class="btn-icon" onclick="closeModal('keyModal')">✕</button></div>
+    <div id="keyFields"></div>
+    <div style="text-align:right;margin-top:16px"><button class="btn btn-primary" onclick="saveKeys()">저장</button></div>
+  </div>
+</div>
+
+<!-- 모달: 새 프로젝트 -->
+<div class="modal-overlay" id="newProjectModal">
+  <div class="modal">
+    <div class="modal-header"><h2>📁 새 프로젝트</h2><button class="btn-icon" onclick="closeModal('newProjectModal')">✕</button></div>
+    <div class="form-group"><label>프로젝트 이름</label><input id="newProjName" placeholder="예: 2026년 과학탐구대회"></div>
+    <div class="form-group"><label>프로젝트 유형</label><select id="newProjType"><option value="report">보고서·수행평가</option><option value="exam">정기고사 서술형</option></select></div>
+    <div class="form-group"><label>설명</label><textarea id="newProjDesc" rows="2"></textarea></div>
+    <div style="text-align:right;margin-top:16px"><button class="btn btn-primary" onclick="createProject()">생성</button></div>
+  </div>
+</div>
+
+<!-- 모달: 팀 상세 -->
+<div class="modal-overlay" id="detailModal">
+  <div class="modal" style="max-width:900px">
+    <div class="modal-header"><h2 id="detailTitle">상세 결과</h2><button class="btn-icon" onclick="closeModal('detailModal')">✕</button></div>
+    <div id="detailContent"></div>
+  </div>
+</div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
