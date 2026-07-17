@@ -237,7 +237,7 @@ def verify_answer_existence(provider, config: ProjectConfig,
     채점 모델이 내용을 환각하면 has_answer 판정도 함께 환각할 수 있으므로,
     채점 압박이 없는 존재-판정 전용 호출로 대조해 어긋나는 문항을 바로잡는다.
     """
-    questions = list(config.exam.questions)
+    questions = list(config.exam.scored_questions())
     if not questions:
         return
     step = on_step or (lambda _message: None)
@@ -397,7 +397,7 @@ def grading_worker(project_id: str, api_keys: dict, start_from: int, delay: int,
                     )
 
                     # 서술형 시험은 독립 검증 패스로 무응답 문항을 교차 확인한다.
-                    if config.project_type == "exam" and config.exam.questions:
+                    if config.project_type == "exam" and config.exam.scored_questions():
                         try:
                             broadcast_event("step", {"team": team_num, "step": "답 존재 여부 검증 중..."})
                             verify_answer_existence(

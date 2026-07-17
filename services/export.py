@@ -235,7 +235,7 @@ def _generate_exam_excel(config: ProjectConfig, results: list[dict], output_path
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
     left = Alignment(horizontal="left", vertical="top", wrap_text=True)
 
-    questions = config.exam.questions
+    questions = config.exam.scored_questions()
     headers = ["번호", "이름"] + [f"{q.number}번 ({q.max_score})" for q in questions]
     headers += [f"총점 ({config.total_max_score})", "검토 필요", "교사 승인", "승인 시각", "교사 메모"]
     for col, title in enumerate(headers, 1):

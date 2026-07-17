@@ -30,11 +30,16 @@ from config import PROJECTS_DIR, AI_MODELS, OPENAI_AI_MODELS, SCALE_PRESETS, API
 from models.project import (
     ProjectConfig, Criterion, Category, MaterialsConfig,
     ExamConfig, ExamQuestion, ScoringElement, StudentRecord, ScanSplitConfig,
-    ProjectSetup, SubmissionLink, WORKFLOW_TYPES,
+    ProjectSetup, SubmissionLink, WORKFLOW_TYPES, ANSWER_TYPES,
+    QUESTION_GRADING_MODES, normalize_exam_questions,
     create_project, save_project, load_project, list_projects, delete_project,
     generate_default_prompt, portable_project_path, resolve_project_path,
 )
 from models.evaluation import compute_scores, generate_fake_subscores_dynamic
+from models.criteria_versions import (
+    load_versions, get_version, snapshot as snapshot_criteria,
+    approve as approve_criteria, summary as criteria_version_summary,
+)
 from services.file_manager import find_materials, get_participant_files, save_uploaded_file
 from services.grading import (
     grading_state, event_queues, broadcast_event,
@@ -100,6 +105,71 @@ def _parse_students(raw_students: list[dict], *, require_students: bool = False)
     return students
 
 
+def _parse_categories(raw_categories: list[dict]) -> list[Category]:
+    categories = []
+    used_ids = set()
+    for category_index, category_data in enumerate(raw_categories or [], 1):
+        criteria = []
+        for criterion_index, criterion_data in enumerate(
+            category_data.get("criteria", []), 1
+        ):
+            criterion_id = str(
+                criterion_data.get("id") or f"c{category_index}_{criterion_index}"
+            )
+            while criterion_id in used_ids:
+                criterion_id = f"{criterion_id}_{criterion_index}"
+            used_ids.add(criterion_id)
+            scale = [
+                int(value)
+                for value in criterion_data.get("scale", [5, 4, 3, 2, 1])
+            ]
+            if not scale:
+                scale = [5, 4, 3, 2, 1]
+            labels = [
+                str(value)
+                for value in criterion_data.get("scale_labels", [])
+            ]
+            if len(labels) != len(scale):
+                labels = [f"등급 {index}" for index in range(1, len(scale) + 1)]
+            criteria.append(Criterion(
+                id=criterion_id,
+                name=str(criterion_data.get("name", criterion_id)),
+                description=str(
+                    criterion_data.get(
+                        "description", criterion_data.get("name", criterion_id)
+                    )
+                ),
+                scale=scale,
+                scale_labels=labels,
+                required_elements=[
+                    str(value).strip()
+                    for value in criterion_data.get("required_elements", [])
+                    if str(value).strip()
+                ],
+                deduction_rules=[
+                    str(value).strip()
+                    for value in criterion_data.get("deduction_rules", [])
+                    if str(value).strip()
+                ],
+                exceptions=[
+                    str(value).strip()
+                    for value in criterion_data.get("exceptions", [])
+                    if str(value).strip()
+                ],
+                feedback_focus=str(criterion_data.get("feedback_focus", "")),
+                core_criteria=[
+                    str(value).strip()
+                    for value in criterion_data.get("core_criteria", [])
+                    if str(value).strip()
+                ],
+            ))
+        categories.append(Category(
+            name=str(category_data.get("name", f"영역 {category_index}")),
+            criteria=criteria,
+        ))
+    return categories
+
+
 def _set_roster(config: ProjectConfig, students: list[StudentRecord]) -> None:
     config.submissions.students = list(students)
     if config.project_type == "exam":
@@ -148,6 +218,7 @@ def _parse_exam_questions(question_data: list[dict]) -> list[ExamQuestion]:
     """API/UI에서 받은 문항 JSON을 검증 가능한 데이터 모델로 변환."""
     questions = []
     used_ids = set()
+    id_map = {}
     for index, item in enumerate(question_data or [], 1):
         raw_id = str(item.get("id") or f"q{index}")
         question_id = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in raw_id)
@@ -156,6 +227,7 @@ def _parse_exam_questions(question_data: list[dict]) -> list[ExamQuestion]:
         while question_id in used_ids:
             question_id = f"{question_id}_{index}"
         used_ids.add(question_id)
+        id_map[raw_id] = question_id
         max_score = max(1, int(item.get("max_score", 1)))
         elements = []
         for raw_element in item.get("scoring_elements", []):
@@ -176,8 +248,54 @@ def _parse_exam_questions(question_data: list[dict]) -> list[ExamQuestion]:
             accepted_answers=[str(v).strip() for v in item.get("accepted_answers", []) if str(v).strip()],
             common_errors=[str(v).strip() for v in item.get("common_errors", []) if str(v).strip()],
             core_criteria=[str(v).strip() for v in item.get("core_criteria", []) if str(v).strip()],
+            parent_id=str(item.get("parent_id", "") or ""),
+            sub_index=max(0, int(item.get("sub_index", 0) or 0)),
+            answer_type=(
+                str(item.get("answer_type", "text") or "text")
+                if str(item.get("answer_type", "text") or "text") in ANSWER_TYPES
+                else "text"
+            ),
+            grading_mode=(
+                str(item.get("grading_mode", "inherit") or "inherit")
+                if str(item.get("grading_mode", "inherit") or "inherit")
+                in QUESTION_GRADING_MODES
+                else "inherit"
+            ),
+            teacher_notes=str(item.get("teacher_notes", "")).strip(),
         ))
+    for question in questions:
+        if question.parent_id in id_map:
+            question.parent_id = id_map[question.parent_id]
+    normalize_exam_questions(questions)
     return questions
+
+
+def _mark_criteria_changed(config: ProjectConfig, source: str = "manual") -> None:
+    """현재 기준이 마지막 스냅샷과 달라졌음을 명시한다."""
+    has_criteria = bool(config.categories or config.exam.questions)
+    config.criteria_state.active_version = 0
+    config.criteria_state.status = (
+        "generated" if source not in {"manual", "restore"} else
+        ("modified" if has_criteria else "empty")
+    )
+    config.criteria_state.source = source
+    config.criteria_state.updated_at = datetime.now().isoformat(timespec="seconds")
+
+
+def _criteria_signature(config: ProjectConfig) -> str:
+    data = config.to_dict()
+    return json.dumps({
+        "categories": data.get("categories", []),
+        "exam_questions": (data.get("exam") or {}).get("questions", []),
+        "exam_grading_mode": (data.get("exam") or {}).get("grading_mode", ""),
+        "additional_instructions": (
+            data.get("exam") or {}
+        ).get("additional_instructions", ""),
+        "report_delivery_mode": config.criteria_state.delivery_mode,
+        "report_prompt_template": (
+            config.prompt_template if config.project_type != "exam" else ""
+        ),
+    }, ensure_ascii=False, sort_keys=True)
 
 
 def _apply_exam_data(config: ProjectConfig, exam_data: dict) -> None:
@@ -460,7 +578,7 @@ def api_list_projects():
 
 @app.route("/api/projects", methods=["POST"])
 def api_create_project():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     workflow_type = data.get("workflow_type")
     if workflow_type not in WORKFLOW_TYPES:
         workflow_type = "exam" if data.get("project_type") == "exam" else "report"
@@ -490,28 +608,20 @@ def api_create_project():
         )
     
     if data.get("categories"):
-        config.categories = []
-        for cat_data in data["categories"]:
-            criteria = []
-            for c_data in cat_data.get("criteria", []):
-                criteria.append(Criterion(
-                    id=c_data["id"],
-                    name=c_data["name"],
-                    description=c_data.get("description", c_data["name"]),
-                    scale=c_data.get("scale", [5, 4, 3, 2, 1]),
-                    scale_labels=c_data.get("scale_labels", ["매우우수", "우수", "보통", "미흡", "매우미흡"]),
-                ))
-            config.categories.append(Category(
-                name=cat_data["name"],
-                criteria=criteria,
-            ))
+        config.categories = _parse_categories(data["categories"])
     
     if data.get("prompt_template"):
         config.prompt_template = data["prompt_template"]
     else:
         config.prompt_template = generate_default_prompt(config)
     
-    config.total_max_score = data.get("total_max_score", sum(cat.max_score for cat in config.categories) or 100)
+    if config.project_type == "exam" and config.exam.questions:
+        config.total_max_score = config.exam.scored_max_score
+    else:
+        config.total_max_score = data.get(
+            "total_max_score",
+            sum(cat.max_score for cat in config.categories) or 100,
+        )
     
     save_project(config)
     return jsonify({
@@ -538,6 +648,211 @@ def api_project_overview(project_id):
     return jsonify(build_project_overview(config))
 
 
+def _criteria_validation(config: ProjectConfig) -> dict:
+    errors = []
+    warnings = []
+    if config.project_type == "exam":
+        scored = config.exam.scored_questions()
+        if not scored:
+            errors.append("실제로 채점할 문항 또는 소문항이 없습니다.")
+        for issue in config.exam.score_validation():
+            errors.append(issue["message"])
+        for question in scored:
+            element_total = sum(
+                element.points for element in question.scoring_elements
+            )
+            if element_total > question.max_score:
+                errors.append(
+                    f"{question.number}번 부분점 합 {element_total}점이 "
+                    f"배점 {question.max_score}점을 초과합니다."
+                )
+            elif question.scoring_elements and element_total < question.max_score:
+                warnings.append(
+                    f"{question.number}번 부분점 합이 배점보다 "
+                    f"{question.max_score - element_total}점 적습니다."
+                )
+            if not question.model_answer.strip():
+                warnings.append(f"{question.number}번 모범답안이 비어 있습니다.")
+            effective_mode = (
+                question.grading_mode
+                if question.grading_mode != "inherit"
+                else config.exam.grading_mode
+            )
+            if effective_mode == "core" and not question.core_criteria:
+                warnings.append(
+                    f"{question.number}번은 핵심 기준 채점이지만 압축 기준이 없습니다."
+                )
+        score = config.exam.scored_max_score
+        unit_count = len(scored)
+    else:
+        criteria = config.all_criteria
+        if not criteria:
+            errors.append("평가 항목이 없습니다.")
+        for criterion in criteria:
+            if not criterion.scale:
+                errors.append(f"{criterion.name} 항목의 배점 척도가 비어 있습니다.")
+            if (
+                config.criteria_state.delivery_mode == "core"
+                and not criterion.core_criteria
+            ):
+                warnings.append(
+                    f"{criterion.name} 항목은 AI용 압축 기준이 없어 상세 설명을 사용합니다."
+                )
+        score = sum(category.max_score for category in config.categories) if criteria else 0
+        unit_count = len(criteria)
+    return {
+        "valid": not errors,
+        "errors": errors,
+        "warnings": warnings,
+        "scored_unit_count": unit_count,
+        "total_max_score": score,
+    }
+
+
+@app.route("/api/projects/<project_id>/criteria-versions", methods=["GET"])
+def api_criteria_versions(project_id):
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    return jsonify({
+        "state": vars(config.criteria_state),
+        "validation": _criteria_validation(config),
+        "versions": [
+            criteria_version_summary(entry)
+            for entry in load_versions(project_id)
+        ],
+    })
+
+
+@app.route("/api/projects/<project_id>/criteria-versions", methods=["POST"])
+def api_create_criteria_version(project_id):
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    validation = _criteria_validation(config)
+    if validation["scored_unit_count"] == 0:
+        return jsonify({"error": "저장할 평가기준이 없습니다."}), 400
+    data = request.get_json(silent=True) or {}
+    source = str(data.get("source") or config.criteria_state.source or "manual")
+    entry = snapshot_criteria(
+        config,
+        source=source,
+        note=str(data.get("note", "")),
+    )
+    config.criteria_state.active_version = entry["version"]
+    config.criteria_state.status = "draft"
+    config.criteria_state.source = entry["source"]
+    config.criteria_state.updated_at = entry["created_at"]
+    save_project(config)
+    return jsonify({
+        "success": True,
+        "state": vars(config.criteria_state),
+        "validation": validation,
+        "version": criteria_version_summary(entry),
+    })
+
+
+@app.route(
+    "/api/projects/<project_id>/criteria-versions/<int:version>",
+    methods=["GET"],
+)
+def api_criteria_version_detail(project_id, version):
+    entry = get_version(project_id, version)
+    if not entry:
+        return jsonify({"error": f"기준 v{version}을 찾을 수 없습니다."}), 404
+    return jsonify(entry)
+
+
+@app.route(
+    "/api/projects/<project_id>/criteria-versions/<int:version>/approve",
+    methods=["POST"],
+)
+def api_approve_criteria_version(project_id, version):
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    if config.criteria_state.active_version != version:
+        return jsonify({
+            "error": "현재 편집 내용과 연결된 버전만 승인할 수 있습니다. 먼저 현재 기준을 새 버전으로 저장하세요."
+        }), 409
+    validation = _criteria_validation(config)
+    if validation["errors"]:
+        return jsonify({
+            "error": "배점 오류를 먼저 수정하세요.",
+            "validation": validation,
+        }), 409
+    entry = approve_criteria(project_id, version)
+    if not entry:
+        return jsonify({"error": f"기준 v{version}을 찾을 수 없습니다."}), 404
+    config.criteria_state.approved_version = version
+    config.criteria_state.status = "approved"
+    config.criteria_state.updated_at = entry["approved_at"]
+    save_project(config)
+    return jsonify({
+        "success": True,
+        "state": vars(config.criteria_state),
+        "version": criteria_version_summary(entry),
+    })
+
+
+@app.route(
+    "/api/projects/<project_id>/criteria-versions/<int:version>/restore",
+    methods=["POST"],
+)
+def api_restore_criteria_version(project_id, version):
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    entry = get_version(project_id, version)
+    if not entry:
+        return jsonify({"error": f"기준 v{version}을 찾을 수 없습니다."}), 404
+    payload = entry.get("payload", {})
+    if payload.get("project_type", config.project_type) != config.project_type:
+        return jsonify({
+            "error": "현재 프로젝트 유형과 다른 평가기준 버전은 복원할 수 없습니다."
+        }), 409
+
+    config.categories = _parse_categories(payload.get("categories", []))
+    exam_payload = payload.get("exam", {}) or {}
+    config.exam.questions = _parse_exam_questions(exam_payload.get("questions", []))
+    mode = str(exam_payload.get("grading_mode", config.exam.grading_mode))
+    if mode in {"autonomous", "core", "strict"}:
+        config.exam.grading_mode = mode
+    config.exam.additional_instructions = str(
+        exam_payload.get(
+            "additional_instructions", config.exam.additional_instructions
+        )
+    )
+    delivery_mode = str(
+        payload.get("report_delivery_mode", config.criteria_state.delivery_mode)
+    )
+    if delivery_mode in {"core", "strict"}:
+        config.criteria_state.delivery_mode = delivery_mode
+    config.total_max_score = (
+        config.exam.scored_max_score
+        if config.project_type == "exam"
+        else sum(category.max_score for category in config.categories) or 100
+    )
+    config.criteria_state.active_version = version
+    config.criteria_state.status = "approved" if entry.get("approved") else "draft"
+    config.criteria_state.source = "restored"
+    config.criteria_state.updated_at = datetime.now().isoformat(timespec="seconds")
+    if entry.get("approved"):
+        config.criteria_state.approved_version = version
+    if config.project_type == "exam":
+        config.prompt_template = generate_default_prompt(config)
+    else:
+        config.prompt_template = str(
+            payload.get("prompt_template", "")
+        ) or generate_default_prompt(config)
+    save_project(config)
+    return jsonify({
+        "success": True,
+        "project": config.to_dict(),
+        "validation": _criteria_validation(config),
+    })
+
+
 @app.route("/api/projects/<project_id>", methods=["PUT"])
 def api_update_project(project_id):
     config = load_project(project_id)
@@ -545,6 +860,7 @@ def api_update_project(project_id):
         return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
     
     data = request.json
+    criteria_signature_before = _criteria_signature(config)
     
     if "name" in data:
         config.name = data["name"]
@@ -581,34 +897,38 @@ def api_update_project(project_id):
         )
     
     if "categories" in data:
-        config.categories = []
-        for cat_data in data["categories"]:
-            criteria = []
-            for c_data in cat_data.get("criteria", []):
-                criteria.append(Criterion(
-                    id=c_data["id"],
-                    name=c_data["name"],
-                    description=c_data.get("description", c_data["name"]),
-                    scale=c_data.get("scale", [5, 4, 3, 2, 1]),
-                    scale_labels=c_data.get("scale_labels", ["매우우수", "우수", "보통", "미흡", "매우미흡"]),
-                ))
-            config.categories.append(Category(
-                name=cat_data["name"],
-                criteria=criteria,
-            ))
+        config.categories = _parse_categories(data["categories"])
         config.total_max_score = sum(cat.max_score for cat in config.categories) or 100
+
+    if "criteria_state" in data:
+        delivery_mode = str(
+            (data.get("criteria_state") or {}).get(
+                "delivery_mode", config.criteria_state.delivery_mode
+            )
+        )
+        if delivery_mode in {"core", "strict"} and delivery_mode != config.criteria_state.delivery_mode:
+            config.criteria_state.delivery_mode = delivery_mode
     
     if "prompt_template" in data:
         config.prompt_template = data["prompt_template"]
     if "exam" in data:
         _apply_exam_data(config, data["exam"] or {})
         if config.project_type == "exam":
-            config.total_max_score = sum(q.max_score for q in config.exam.questions)
+            config.total_max_score = config.exam.scored_max_score
             # 채점 방식·문항이 바뀌면 실제 채점 프롬프트도 함께 갱신한다.
             # (서술형 프로젝트의 프롬프트는 UI에서 직접 편집하지 않는다.)
             config.prompt_template = generate_default_prompt(config)
     elif "total_max_score" in data:
         config.total_max_score = max(1, int(data["total_max_score"] or 1))
+
+    if _criteria_signature(config) != criteria_signature_before:
+        source = str(data.get("criteria_change_source", "manual"))
+        _mark_criteria_changed(
+            config,
+            source if source in {
+                "manual", "official", "generated", "synthesized", "compressed"
+            } else "manual",
+        )
     
     save_project(config)
     return jsonify(config.to_dict())
@@ -872,6 +1192,7 @@ def api_exam_split(project_id):
 EXAM_QUESTION_SCHEMA = {
     "type": "object",
     "properties": {
+        "id": {"type": "string"},
         "number": {"type": "string"},
         "question_text": {"type": "string"},
         "max_score": {"type": "integer"},
@@ -891,6 +1212,17 @@ EXAM_QUESTION_SCHEMA = {
         "accepted_answers": {"type": "array", "items": {"type": "string"}},
         "common_errors": {"type": "array", "items": {"type": "string"}},
         "core_criteria": {"type": "array", "items": {"type": "string"}},
+        "parent_id": {"type": "string"},
+        "sub_index": {"type": "integer"},
+        "answer_type": {
+            "type": "string",
+            "enum": list(ANSWER_TYPES),
+        },
+        "grading_mode": {
+            "type": "string",
+            "enum": list(QUESTION_GRADING_MODES),
+        },
+        "teacher_notes": {"type": "string"},
         "source_kind": {"type": "string"},
         "source_notes": {"type": "string"},
     },
@@ -935,6 +1267,19 @@ EXAM_SOURCE_MODES = {
     "combined_answers": "같은 인쇄 문항과 여러 학생의 필기 답안이 반복되는 통합 스캔",
     "answers_only": "문제 원문이 없거나 일부만 있고 여러 학생 답안으로 문제를 추정해야 하는 자료",
 }
+
+EXAM_STRUCTURE_GUIDANCE = (
+    "\n문항 구조 규칙:\n"
+    "- 소문항이 없는 대문항은 하나의 채점 문항으로 출력하세요.\n"
+    "- 소문항이 있는 대문항은 공통 지문용 부모 객체와 소문항 객체들로 나누세요. "
+    "부모에는 고유한 id(예: q1), 대문항 번호, 공통 지문, 소문항 합계와 같은 max_score를 넣고 "
+    "model_answer와 scoring_elements는 비워 두세요.\n"
+    "- 각 소문항은 parent_id에 부모 id를 넣고 sub_index를 1부터 순서대로 지정하세요. "
+    "소문항 번호는 1-(1), 1-(2)처럼 대문항과 구별하고, 실제 모범답안·부분점 기준·배점은 "
+    "소문항 객체에 넣으세요. 모든 소문항 max_score의 합은 부모 max_score와 같아야 합니다.\n"
+    "- answer_type은 short, text, formula, diagram, mixed 중 하나로 판단하고, "
+    "grading_mode는 별도 지시가 없으면 inherit로 두세요. 모든 id는 응답 안에서 고유해야 합니다.\n"
+)
 
 
 def _document_page_count(path: Path) -> int | None:
@@ -1000,19 +1345,73 @@ def _missing_question_numbers(
 def _merge_question_candidates(
     first: list[ExamQuestion], second: list[ExamQuestion]
 ) -> list[ExamQuestion]:
-    merged: dict[str, ExamQuestion] = {}
-    for question in [*first, *second]:
-        key = str(question.number).strip().casefold()
-        if key:
-            merged[key] = question
-    result = list(merged.values())
-    result.sort(key=lambda question: (
-        _main_question_number(question.number) is None,
-        _main_question_number(question.number) or 0,
-        str(question.number),
+    """두 차례 추출 결과를 합치면서 소문항의 부모 연결을 보존한다."""
+    merged: dict[tuple[str, str], tuple[ExamQuestion, str]] = {}
+    for batch in (first, second):
+        by_id = {question.id: question for question in batch}
+        for question in batch:
+            number = str(question.number).strip()
+            if not number:
+                continue
+            parent = by_id.get(question.parent_id) if question.parent_id else None
+            parent_number = str(parent.number).strip() if parent else ""
+            key = (parent_number.casefold(), number.casefold())
+            merged[key] = (question, parent_number)
+
+    entries = list(merged.values())
+    top_entries = [entry for entry in entries if not entry[1]]
+    top_numbers = {
+        str(question.number).strip().casefold() for question, _ in top_entries
+    }
+    # 부모 객체가 한 추출 응답에 빠진 고아 소문항은 독립 문항으로 보존한다.
+    orphan_entries = [
+        (question, "")
+        for question, parent_number in entries
+        if parent_number and parent_number.casefold() not in top_numbers
+    ]
+    child_entries = [
+        entry
+        for entry in entries
+        if entry[1] and entry[1].casefold() in top_numbers
+    ]
+    top_entries.extend(orphan_entries)
+    top_entries.sort(key=lambda entry: (
+        _main_question_number(entry[0].number) is None,
+        _main_question_number(entry[0].number) or 0,
+        str(entry[0].number),
     ))
-    for index, question in enumerate(result, 1):
+
+    result = []
+    root_ids = {}
+    for index, (question, _) in enumerate(top_entries, 1):
         question.id = f"q{index}"
+        question.parent_id = ""
+        question.sub_index = 0
+        root_ids[str(question.number).strip().casefold()] = question.id
+        result.append(question)
+
+    children_by_parent: dict[str, list[ExamQuestion]] = {}
+    for question, parent_number in child_entries:
+        children_by_parent.setdefault(parent_number.casefold(), []).append(question)
+    for parent_number, children in children_by_parent.items():
+        children.sort(key=lambda question: (
+            question.sub_index <= 0,
+            question.sub_index if question.sub_index > 0 else 0,
+            str(question.number),
+        ))
+        parent_id = root_ids[parent_number]
+        parent_position = next(
+            index for index, item in enumerate(result) if item.id == parent_id
+        )
+        normalized_children = []
+        for sub_index, question in enumerate(children, 1):
+            question.id = f"{parent_id}_s{sub_index}"
+            question.parent_id = parent_id
+            question.sub_index = sub_index
+            normalized_children.append(question)
+        result[parent_position + 1:parent_position + 1] = normalized_children
+
+    normalize_exam_questions(result)
     return result
 
 
@@ -1031,9 +1430,10 @@ def _exam_extraction_warnings(
     duplicates = sorted({number for number in numbers if number and numbers.count(number) > 1})
     if duplicates:
         warnings.append("중복된 문항 번호: " + ", ".join(duplicates))
-    if expected_count and len(questions) != expected_count:
+    main_count = len(_question_numbers(questions))
+    if expected_count and main_count != expected_count:
         warnings.append(
-            f"예상 대문항 수는 {expected_count}개이지만 {len(questions)}개를 추출했습니다."
+            f"예상 대문항 수는 {expected_count}개이지만 {main_count}개를 추출했습니다."
         )
     for question in questions:
         points = sum(element.points for element in question.scoring_elements)
@@ -1098,6 +1498,7 @@ def _build_exam_discovery_prompt(
           "answers_only 중 하나로 쓰고, coverage_notes에는 페이지 반복·누락·추정 여부를 간단히 기록하세요. "
           "각 문항에는 원문 또는 보수적으로 복원한 문제, 총 배점, 모범답안, 부분점 요소, 허용 답안과 주요 오류를 작성하세요. "
           "부분점 합은 총 배점을 초과할 수 없습니다."
+        + EXAM_STRUCTURE_GUIDANCE
     )
 
 
@@ -1147,9 +1548,13 @@ def api_exam_extract_official_rubric(project_id):
 
     existing_summary = [
         {
+            "id": question.id,
             "number": question.number,
             "question_text": question.question_text,
             "max_score": question.max_score,
+            "parent_id": question.parent_id,
+            "sub_index": question.sub_index,
+            "answer_type": question.answer_type,
         }
         for question in config.exam.questions
     ]
@@ -1158,6 +1563,8 @@ def api_exam_extract_official_rubric(project_id):
         "새 기준을 만들지 말고, 문항 번호·배점·모범답안·부분점 요소·허용 답안·감점 사례를 "
         "편집 가능한 구조로 정확히 옮기세요. 부분점 합계는 문항 배점을 초과할 수 없습니다. "
         "문제 원문이 기준표에 생략되어 있으면 아래 기존 문항 정보의 같은 번호를 사용하세요.\n"
+        + EXAM_STRUCTURE_GUIDANCE
+        + "\n"
         "기존 문항 정보:\n"
         + json.dumps(existing_summary, ensure_ascii=False)
     )
@@ -1179,7 +1586,8 @@ def api_exam_extract_official_rubric(project_id):
         # 공식 기준표를 올렸다는 것은 그 기준의 준수가 중요하다는 뜻이므로
         # 엄격 적용을 기본으로 두고, 교사가 채점 방식에서 바꿀 수 있게 한다.
         config.exam.grading_mode = "strict"
-        config.total_max_score = sum(question.max_score for question in questions)
+        config.total_max_score = config.exam.scored_max_score
+        _mark_criteria_changed(config, "official")
         config.prompt_template = generate_default_prompt(config)
         save_project(config)
         return jsonify({
@@ -1246,7 +1654,7 @@ def _build_rubric_synthesis_prompt(config, completed: dict) -> str:
         "- rationale에는 이 기준안이 실제 채점 결과와 어떻게 부합하는지 한두 문장으로 쓰세요.",
         "- 채점 결과에서 관찰되지 않은 내용을 지어내지 마세요.",
     ]
-    for question in config.exam.questions:
+    for question in config.exam.scored_questions():
         lines.extend([
             "",
             f"## {question.number}번 (배점 {question.max_score}점)",
@@ -1272,7 +1680,7 @@ def api_exam_synthesize_rubric(project_id):
     config = load_project(project_id)
     if not config:
         return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
-    if config.project_type != "exam" or not config.exam.questions:
+    if config.project_type != "exam" or not config.exam.scored_questions():
         return jsonify({"error": "서술형 시험 프로젝트에서 문항을 먼저 준비하세요."}), 400
 
     data = request.get_json(silent=True) or {}
@@ -1305,7 +1713,7 @@ def api_exam_synthesize_rubric(project_id):
             drafts[number] = item
 
     merged = []
-    for question in config.exam.questions:
+    for question in config.exam.scored_questions():
         draft = drafts.get(str(question.number).strip())
         if not draft:
             continue
@@ -1350,10 +1758,15 @@ def api_exam_compress_criteria(project_id):
     config = load_project(project_id)
     if not config:
         return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
-    if config.project_type != "exam" or not config.exam.questions:
+    if config.project_type != "exam" or not config.exam.scored_questions():
         return jsonify({"error": "서술형 문항을 먼저 준비하세요."}), 400
 
-    detailed = config.to_dict()["exam"]["questions"]
+    scored_ids = {question.id for question in config.exam.scored_questions()}
+    detailed = [
+        question
+        for question in config.to_dict()["exam"]["questions"]
+        if question.get("id") in scored_ids
+    ]
     prompt = (
         "당신은 서술형 채점 기준을 정리하는 교사 보조자입니다.\n"
         "아래 문항별 상세 채점 기준을, AI가 채점할 때 반드시 확인해야 할 "
@@ -1401,7 +1814,7 @@ def api_exam_compress_criteria(project_id):
                 str(v).strip() for v in (item.get("core_criteria") or []) if str(v).strip()
             ][:6]
     updated = 0
-    for question in config.exam.questions:
+    for question in config.exam.scored_questions():
         criteria = by_number.get(str(question.number).strip())
         if criteria:
             question.core_criteria = criteria
@@ -1409,6 +1822,7 @@ def api_exam_compress_criteria(project_id):
     if not updated:
         return jsonify({"error": "핵심 기준을 만들지 못했습니다. 상세 기준을 확인하세요."}), 500
 
+    _mark_criteria_changed(config, "compressed")
     config.prompt_template = generate_default_prompt(config)
     save_project(config)
     return jsonify({
@@ -1448,6 +1862,8 @@ def api_exam_rubric_from_text(project_id):
             "2. 지시가 특정 문항만 언급하면 그 문항만 바꾸고 나머지는 건드리지 마세요.\n"
             "3. 각 문항의 부분점 합이 배점(max_score)을 넘지 않게 하세요.\n"
             "4. 문항의 추가·삭제·번호 변경은 교사가 명시적으로 지시했을 때만 하세요.\n\n"
+            + EXAM_STRUCTURE_GUIDANCE
+            + "\n"
             "## 현재 문항 목록\n"
             + json.dumps(existing, ensure_ascii=False)
             + "\n\n## 교사 지시\n"
@@ -1465,6 +1881,8 @@ def api_exam_rubric_from_text(project_id):
             "2. 교사가 문항 수나 배점을 명시했으면 정확히 따르세요.\n"
             "3. 교사가 주지 않은 내용은 과목과 문제 맥락에 맞는 합리적인 초안으로 채우되, "
             "교사가 검토·수정할 것을 전제로 간결하게 작성하세요.\n\n"
+            + EXAM_STRUCTURE_GUIDANCE
+            + "\n"
             "## 교사 설명\n"
             + text
         )
@@ -1489,7 +1907,8 @@ def api_exam_rubric_from_text(project_id):
         return jsonify({"error": "지시에서 문항을 만들지 못했습니다. 설명을 조금 더 구체적으로 써 주세요."}), 500
 
     config.exam.questions = questions
-    config.total_max_score = sum(q.max_score for q in questions)
+    config.total_max_score = config.exam.scored_max_score
+    _mark_criteria_changed(config, "generated")
     config.prompt_template = generate_default_prompt(config)
     save_project(config)
     return jsonify({
@@ -1590,9 +2009,12 @@ def api_exam_generate_rubric(project_id):
             or (
                 page_count is not None
                 and page_count >= 12
-                and len(first_questions) <= 5
+                and len(_question_numbers(first_questions)) <= 5
             )
-            or (expected_count and len(first_questions) != expected_count)
+            or (
+                expected_count
+                and len(_question_numbers(first_questions)) != expected_count
+            )
         )
 
         questions = first_questions
@@ -1672,7 +2094,10 @@ def api_exam_generate_rubric(project_id):
                 "needs_review": True,
             }), 422
         config.exam.questions = questions
-        config.total_max_score = sum(q.max_score for q in questions)
+        config.total_max_score = config.exam.scored_max_score
+        _mark_criteria_changed(
+            config, "official" if has_rubric else "generated"
+        )
         config.prompt_template = generate_default_prompt(config)
         save_project(config)
         return jsonify({
@@ -1818,8 +2243,14 @@ def api_start_grading(project_id):
     
     # 채점 기준 확인
     if config.project_type == "exam":
-        if not config.exam.questions:
+        if not config.exam.scored_questions():
             return jsonify({"error": "서술형 문항과 채점 기준을 먼저 준비하세요."}), 400
+        validation = _criteria_validation(config)
+        if validation["errors"]:
+            return jsonify({
+                "error": "문항 배점 오류를 먼저 수정하세요.",
+                "validation": validation,
+            }), 409
     elif not config.all_criteria:
         return jsonify({"error": "채점 기준(Rubric)이 설정되지 않았습니다. 설정 탭에서 채점 기준을 추가하세요."}), 400
     
@@ -2253,6 +2684,11 @@ REPORT_RUBRIC_SCHEMA = {
                                 "description": {"type": "string"},
                                 "scale": {"type": "array", "items": {"type": "integer"}},
                                 "scale_labels": {"type": "array", "items": {"type": "string"}},
+                                "required_elements": {"type": "array", "items": {"type": "string"}},
+                                "deduction_rules": {"type": "array", "items": {"type": "string"}},
+                                "exceptions": {"type": "array", "items": {"type": "string"}},
+                                "feedback_focus": {"type": "string"},
+                                "core_criteria": {"type": "array", "items": {"type": "string"}},
                             },
                             "required": ["name", "description", "scale", "scale_labels"],
                         },
@@ -2280,6 +2716,17 @@ def _normalize_report_rubric(result: dict) -> dict:
             if len(labels) != len(criterion["scale"]):
                 labels = [f"등급{i + 1}" for i in range(len(criterion["scale"]))]
             criterion["scale_labels"] = labels
+            for field_name in (
+                "required_elements", "deduction_rules", "exceptions", "core_criteria"
+            ):
+                criterion[field_name] = [
+                    str(value).strip()
+                    for value in criterion.get(field_name, [])
+                    if str(value).strip()
+                ]
+            criterion["feedback_focus"] = str(
+                criterion.get("feedback_focus", "")
+            )
     return {"categories": categories, "prompt_template": result.get("prompt_template", "")}
 
 

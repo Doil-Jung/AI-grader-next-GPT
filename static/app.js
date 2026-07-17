@@ -6,6 +6,8 @@ let currentOverview = null;
 let wizardStep = 1;
 let currentSubmissionStatus = null;
 let submissionFilesByIndex = [];
+let currentCriteriaVersions = null;
+let pendingCriteriaSource = null;
 
 const WORKFLOW_LABELS = {
   report: '보고서·수행평가',
@@ -382,6 +384,9 @@ async function populateSettings() {
   renderExamSettings();
   updateProjectModeUI();
   await updateProviderUI();
+  const deliveryMode = document.getElementById('reportCriteriaDeliveryMode');
+  if (deliveryMode) deliveryMode.value = currentProject.criteria_state?.delivery_mode || 'strict';
+  await loadCriteriaVersions();
 }
 
 function changeProjectType(value) {
@@ -398,6 +403,8 @@ function changeProjectType(value) {
 
 function updateProjectModeUI() {
   const isExam = currentProject?.project_type === 'exam';
+  const reportCriteriaVersionCard = document.getElementById('reportCriteriaVersionCard');
+  if (reportCriteriaVersionCard) reportCriteriaVersionCard.style.display = isExam ? 'none' : '';
   document.getElementById('reportRubricCard').style.display = isExam ? 'none' : '';
   document.getElementById('reportPromptCard').style.display = isExam ? 'none' : '';
   document.getElementById('examIntegratedMaterialsCard').style.display = isExam ? '' : 'none';
@@ -444,7 +451,22 @@ function renderCriterionItem(ci, i, c) {
       <input value="${esc(c.description)}" placeholder="설명" style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:6px 10px;color:var(--text);font-size:.85rem;flex:2" onchange="currentProject.categories[${ci}].criteria[${i}].description=this.value">
       <input value="${c.scale?.join(',') || '5,4,3,2,1'}" placeholder="척도(콤마)" style="max-width:140px;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:6px 10px;color:var(--text);font-size:.85rem" onchange="currentProject.categories[${ci}].criteria[${i}].scale=this.value.split(',').map(Number)">
     </div>
+    <details class="criteria-detail-editor">
+      <summary>교사용 상세 기준 · AI용 압축 기준</summary>
+      <div class="form-row">
+        <div class="form-group"><label>필수 확인 요소</label><textarea rows="3" onchange="updateCriterionList(${ci},${i},'required_elements',this.value)">${esc((c.required_elements || []).join('\n'))}</textarea></div>
+        <div class="form-group"><label>감점 규칙</label><textarea rows="3" onchange="updateCriterionList(${ci},${i},'deduction_rules',this.value)">${esc((c.deduction_rules || []).join('\n'))}</textarea></div>
+        <div class="form-group"><label>예외·인정 기준</label><textarea rows="3" onchange="updateCriterionList(${ci},${i},'exceptions',this.value)">${esc((c.exceptions || []).join('\n'))}</textarea></div>
+        <div class="form-group"><label>피드백 관점</label><textarea rows="3" onchange="currentProject.categories[${ci}].criteria[${i}].feedback_focus=this.value">${esc(c.feedback_focus || '')}</textarea></div>
+      </div>
+      <div class="form-group"><label>AI용 핵심 기준 — 한 줄에 하나</label><textarea rows="3" onchange="updateCriterionList(${ci},${i},'core_criteria',this.value)">${esc((c.core_criteria || []).join('\n'))}</textarea></div>
+    </details>
   </div>`;
+}
+
+function updateCriterionList(categoryIndex, criterionIndex, field, value) {
+  currentProject.categories[categoryIndex].criteria[criterionIndex][field] = value
+    .split(/\r?\n/).map(item => item.trim()).filter(Boolean);
 }
 
 function addCategory() {
@@ -465,11 +487,17 @@ function addCriterion(ci) {
     }
   }
   const id = 'c' + (maxNum + 1);
-  cats[ci].criteria.push({ id, name: '새 항목', description: '새 항목 설명', scale: [5, 4, 3, 2, 1], scale_labels: ['매우우수', '우수', '보통', '미흡', '매우미흡'] });
+  cats[ci].criteria.push({
+    id, name: '새 항목', description: '새 항목 설명',
+    scale: [5, 4, 3, 2, 1],
+    scale_labels: ['매우우수', '우수', '보통', '미흡', '매우미흡'],
+    required_elements: [], deduction_rules: [], exceptions: [],
+    feedback_focus: '', core_criteria: [],
+  });
   renderRubric();
 }
 
-async function saveSettings() {
+async function saveSettings(options = {}) {
   if (!currentProject) return alert('프로젝트를 먼저 선택하세요');
   currentProject.name = document.getElementById('cfgName').value;
   currentProject.description = document.getElementById('cfgDesc').value;
@@ -479,19 +507,149 @@ async function saveSettings() {
   currentProject.ai_provider = document.getElementById('cfgProvider').value;
   currentProject.temperature = parseFloat(document.getElementById('cfgTemp').value);
   currentProject.prompt_template = document.getElementById('cfgPrompt').value;
+  if (!currentProject.criteria_state) currentProject.criteria_state = {};
+  const reportDelivery = document.getElementById('reportCriteriaDeliveryMode');
+  if (reportDelivery) currentProject.criteria_state.delivery_mode = reportDelivery.value;
   if (currentProject.project_type === 'exam' && currentProject.exam) {
     currentProject.exam.additional_instructions = document.getElementById('examAdditionalInstructions')?.value.trim() || '';
     currentProject.exam.grading_mode = document.getElementById('examGradingMode')?.value || currentProject.exam.grading_mode || 'strict';
     currentProject.exam.source_mode = document.getElementById('examSourceMode')?.value || 'auto';
     currentProject.exam.expected_question_count = Math.max(0, parseInt(document.getElementById('examExpectedQuestionCount')?.value) || 0);
   }
-  const res = await fetch(`/api/projects/${currentProject.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(currentProject) });
-  if (!res.ok) { const err = await res.json(); return alert(err.error || '저장 실패'); }
+  const payload = {
+    ...currentProject,
+    criteria_change_source: pendingCriteriaSource || 'manual',
+  };
+  const res = await fetch(`/api/projects/${currentProject.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+  if (!res.ok) {
+    const err = await res.json();
+    if (!options.silent) alert(err.error || '저장 실패');
+    return false;
+  }
   currentProject = await res.json();
+  pendingCriteriaSource = null;
   await populateSettings();
   updateAppShell();
-  alert('설정이 저장되었습니다');
+  if (!options.silent) alert('설정이 저장되었습니다');
   loadProjects();
+  return true;
+}
+
+async function loadCriteriaVersions() {
+  if (!currentProject) return;
+  const res = await fetch(`/api/projects/${currentProject.id}/criteria-versions`);
+  const data = await res.json();
+  if (!res.ok) return;
+  currentCriteriaVersions = data;
+  currentProject.criteria_state = data.state;
+  renderCriteriaVersionPanel('report', data);
+  renderCriteriaVersionPanel('exam', data);
+}
+
+function renderCriteriaVersionPanel(prefix, data) {
+  const status = document.getElementById(`${prefix}CriteriaStatus`);
+  const validation = document.getElementById(`${prefix}CriteriaValidation`);
+  const select = document.getElementById(`${prefix}CriteriaVersionSelect`);
+  const approveButton = document.getElementById(`${prefix}CriteriaApproveButton`);
+  if (!status || !validation || !select || !approveButton) return;
+
+  const stateLabels = {
+    empty: '기준 없음',
+    unversioned: '기존 기준 · 버전 미저장',
+    generated: 'AI 생성 초안 · 승인 필요',
+    modified: '수정됨 · 새 버전 필요',
+    draft: `v${data.state.active_version || '?'} 초안`,
+    approved: `v${data.state.approved_version || data.state.active_version} 교사 승인`,
+  };
+  status.textContent = stateLabels[data.state.status] || '기준 확인 필요';
+  status.className = `criteria-state-badge state-${data.state.status || 'empty'}`;
+
+  const messages = [
+    ...(data.validation.errors || []).map(message => `<div class="criteria-error">❌ ${esc(message)}</div>`),
+    ...(data.validation.warnings || []).map(message => `<div class="criteria-warning">⚠️ ${esc(message)}</div>`),
+  ];
+  if (!messages.length && data.validation.scored_unit_count) {
+    messages.push(`<div class="criteria-ok">✅ 채점 단위 ${data.validation.scored_unit_count}개 · 총 ${data.validation.total_max_score}점</div>`);
+  }
+  validation.innerHTML = messages.join('');
+
+  const versions = [...(data.versions || [])].sort((a, b) => b.version - a.version);
+  select.innerHTML = versions.length
+    ? versions.map(version => `<option value="${version.version}" ${version.version === data.state.active_version ? 'selected' : ''}>v${version.version} · ${version.approved ? '승인' : '초안'} · ${criteriaSourceLabel(version.source)} · ${formatDateTime(version.created_at)}</option>`).join('')
+    : '<option value="">저장된 버전 없음</option>';
+  approveButton.disabled = !data.state.active_version
+    || data.state.status === 'approved'
+    || Boolean(data.validation.errors?.length);
+}
+
+function criteriaSourceLabel(source) {
+  return ({
+    manual: '교사 편집',
+    official: '공식 기준',
+    generated: 'AI 생성',
+    synthesized: '선채점 기준화',
+    compressed: 'AI 기준 압축',
+    restored: '이전 버전 복원',
+  })[source] || source || '기준';
+}
+
+async function saveCriteriaVersion() {
+  if (!currentProject) return;
+  if (!await saveSettings({ silent: true })) return;
+  const source = currentProject.criteria_state?.source || 'manual';
+  const res = await fetch(`/api/projects/${currentProject.id}/criteria-versions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source }),
+  });
+  const data = await res.json();
+  if (!res.ok) return alert(data.error || '평가기준 버전 저장 실패');
+  await selectProject(currentProject.id, true);
+  alert(`평가기준 v${data.version.version} 초안을 저장했습니다.`);
+}
+
+async function approveActiveCriteria() {
+  if (!currentProject) return;
+  // 화면에 보이는 미저장 수정이 있으면 서버 상태에 먼저 반영한다.
+  // 이때 기존 버전과 달라졌다면 active_version이 0으로 바뀌어 이전 버전의 오승인을 막는다.
+  if (!await saveSettings({ silent: true })) return;
+  if (!currentCriteriaVersions?.state?.active_version) {
+    return alert('먼저 현재 기준을 새 버전으로 저장하세요.');
+  }
+  const version = currentCriteriaVersions.state.active_version;
+  if (!confirm(`평가기준 v${version}을 교사 승인 기준으로 확정할까요?`)) return;
+  const res = await fetch(`/api/projects/${currentProject.id}/criteria-versions/${version}/approve`, {
+    method: 'POST',
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    const details = data.validation?.errors?.join('\n');
+    return alert([data.error || '승인 실패', details].filter(Boolean).join('\n'));
+  }
+  await selectProject(currentProject.id, true);
+}
+
+async function restoreSelectedCriteria(prefix) {
+  if (!currentProject) return;
+  const version = parseInt(document.getElementById(`${prefix}CriteriaVersionSelect`)?.value);
+  if (!version) return alert('복원할 버전이 없습니다.');
+  if (!confirm(`평가기준 v${version}으로 되돌릴까요? 현재 편집 중인 기준은 새 버전으로 저장하지 않았다면 사라집니다.`)) return;
+  const res = await fetch(`/api/projects/${currentProject.id}/criteria-versions/${version}/restore`, {
+    method: 'POST',
+  });
+  const data = await res.json();
+  if (!res.ok) return alert(data.error || '버전 복원 실패');
+  currentProject = data.project;
+  await populateSettings();
+  updateAppShell();
+}
+
+async function previewCriteriaPrompt() {
+  if (!await saveSettings({ silent: true })) return;
+  const preview = document.getElementById('examCriteriaPromptPreview');
+  if (!preview) return;
+  preview.textContent = currentProject.prompt_template || '생성된 AI 전달 기준이 없습니다.';
+  preview.style.display = preview.style.display === 'none' ? '' : 'none';
 }
 
 
@@ -549,15 +707,63 @@ function renderExamQuestions() {
     el.innerHTML = '<div class="empty-state"><p>문제지를 업로드하여 기준을 생성하거나 문항을 직접 추가하세요.</p></div>';
     return;
   }
-  el.innerHTML = questions.map((q, index) => {
+  const indexed = questions.map((question, index) => ({ question, index }));
+  const ordered = [];
+  for (const item of indexed.filter(item => !item.question.parent_id)) {
+    ordered.push(item);
+    ordered.push(...indexed
+      .filter(child => child.question.parent_id === item.question.id)
+      .sort((a, b) => (a.question.sub_index || 0) - (b.question.sub_index || 0)));
+  }
+  const known = new Set(ordered.map(item => item.index));
+  ordered.push(...indexed.filter(item => !known.has(item.index)));
+
+  el.innerHTML = ordered.map(({ question: q, index }) => {
+    const children = indexed
+      .filter(item => item.question.parent_id === q.id)
+      .sort((a, b) => (a.question.sub_index || 0) - (b.question.sub_index || 0));
+    const isGroup = children.length > 0;
+    const isChild = Boolean(q.parent_id);
     const elementText = (q.scoring_elements || []).map(e => `${e.points}|${e.required === false ? '선택' : '필수'}|${e.description}`).join('\n');
     const points = (q.scoring_elements || []).reduce((sum, e) => sum + Number(e.points || 0), 0);
     const pointColor = points > Number(q.max_score || 0) ? 'var(--danger)' : 'var(--text2)';
-    return `<div class="card" style="background:var(--surface2)">
-      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+    if (isGroup) {
+      const childTotal = children.reduce((sum, item) => sum + Number(item.question.max_score || 0), 0);
+      const mismatch = childTotal !== Number(q.max_score || 0);
+      return `<div class="card exam-question-card exam-question-group">
+        <div class="exam-question-header">
+          <span class="question-kind">대문항 묶음</span>
+          <input value="${esc(q.number)}" style="max-width:90px" aria-label="대문항 번호" onchange="updateExamQuestion(${index},'number',this.value)">
+          <input type="number" min="1" value="${q.max_score || 1}" style="max-width:100px" aria-label="대문항 배점" onchange="updateExamQuestion(${index},'max_score',this.value)">
+          <span class="score-check ${mismatch ? 'error' : 'success'}">소문항 합 ${childTotal}/${q.max_score || 1}${mismatch ? ' · 수정 필요' : ''}</span>
+          <button class="btn btn-secondary btn-sm" onclick="addExamSubQuestion(${index})">+ 소문항</button>
+          <button class="btn-icon" style="margin-left:auto" onclick="removeExamQuestion(${index})">🗑</button>
+        </div>
+        <div class="form-group"><label>공통 지문·조건</label><textarea rows="3" onchange="updateExamQuestion(${index},'question_text',this.value)">${esc(q.question_text || '')}</textarea></div>
+        <div class="form-group"><label>교사 메모 — AI에는 전달하지 않음</label><textarea rows="2" onchange="updateExamQuestion(${index},'teacher_notes',this.value)">${esc(q.teacher_notes || '')}</textarea></div>
+      </div>`;
+    }
+
+    return `<div class="card exam-question-card ${isChild ? 'exam-sub-question' : ''}">
+      <div class="exam-question-header">
+        <span class="question-kind">${isChild ? '소문항' : '채점 문항'}</span>
         <input value="${esc(q.number)}" style="max-width:80px" aria-label="문항 번호" onchange="updateExamQuestion(${index},'number',this.value)">
         <input type="number" min="1" value="${q.max_score || 1}" style="max-width:100px" aria-label="배점" onchange="updateExamQuestion(${index},'max_score',this.value)">
-        <span style="font-size:.8rem;color:${pointColor}">부분점 합 ${points}/${q.max_score || 1}</span>
+        <span class="score-check" style="color:${pointColor}">부분점 합 ${points}/${q.max_score || 1}</span>
+        <select aria-label="답안 유형" onchange="updateExamQuestion(${index},'answer_type',this.value)">
+          <option value="short" ${q.answer_type === 'short' ? 'selected' : ''}>단답형</option>
+          <option value="text" ${!q.answer_type || q.answer_type === 'text' ? 'selected' : ''}>문장 서술형</option>
+          <option value="formula" ${q.answer_type === 'formula' ? 'selected' : ''}>수식·계산형</option>
+          <option value="diagram" ${q.answer_type === 'diagram' ? 'selected' : ''}>그래프·도식형</option>
+          <option value="mixed" ${q.answer_type === 'mixed' ? 'selected' : ''}>복합형</option>
+        </select>
+        <select aria-label="문항 채점 방식" onchange="updateExamQuestion(${index},'grading_mode',this.value)">
+          <option value="inherit" ${!q.grading_mode || q.grading_mode === 'inherit' ? 'selected' : ''}>전체 설정 따름</option>
+          <option value="autonomous" ${q.grading_mode === 'autonomous' ? 'selected' : ''}>자율 선채점</option>
+          <option value="core" ${q.grading_mode === 'core' ? 'selected' : ''}>핵심 기준</option>
+          <option value="strict" ${q.grading_mode === 'strict' ? 'selected' : ''}>공식 기준 엄격</option>
+        </select>
+        ${!isChild ? `<button class="btn btn-secondary btn-sm" onclick="addExamSubQuestion(${index})">소문항으로 나누기</button>` : ''}
         <button class="btn-icon" style="margin-left:auto" onclick="removeExamQuestion(${index})">🗑</button>
       </div>
       <div class="form-group"><label>문제</label><textarea rows="2" onchange="updateExamQuestion(${index},'question_text',this.value)">${esc(q.question_text || '')}</textarea></div>
@@ -568,6 +774,7 @@ function renderExamQuestions() {
         <div class="form-group"><label>주요 감점 사례 - 줄바꿈 구분</label><textarea rows="2" onchange="updateExamList(${index},'common_errors',this.value)">${esc((q.common_errors || []).join('\n'))}</textarea></div>
       </div>
       <div class="form-group"><label>🗜 핵심 확인 요소 (AI 채점용, 핵심 기준 채점 방식에서 사용) - 줄바꿈 구분</label><textarea rows="2" onchange="updateExamList(${index},'core_criteria',this.value)">${esc((q.core_criteria || []).join('\n'))}</textarea></div>
+      <div class="form-group"><label>교사 메모 — AI에는 전달하지 않음</label><textarea rows="2" onchange="updateExamQuestion(${index},'teacher_notes',this.value)">${esc(q.teacher_notes || '')}</textarea></div>
     </div>`;
   }).join('');
 }
@@ -592,13 +799,68 @@ function updateExamList(index, field, value) {
 
 function addExamQuestion() {
   if (!currentProject?.exam) return;
-  const index = currentProject.exam.questions.length + 1;
-  currentProject.exam.questions.push({ id: `q${index}`, number: String(index), question_text: '', max_score: 5, model_answer: '', scoring_elements: [], accepted_answers: [], common_errors: [] });
+  const questions = currentProject.exam.questions;
+  let index = questions.length + 1;
+  while (questions.some(question => question.id === `q${index}`)) index += 1;
+  currentProject.exam.questions.push({
+    id: `q${index}`, number: String(index), question_text: '', max_score: 5,
+    model_answer: '', scoring_elements: [], accepted_answers: [], common_errors: [],
+    core_criteria: [], parent_id: '', sub_index: 0, answer_type: 'text',
+    grading_mode: 'inherit', teacher_notes: '',
+  });
+  renderExamQuestions();
+}
+
+function addExamSubQuestion(parentIndex) {
+  const questions = currentProject.exam.questions;
+  const parent = questions[parentIndex];
+  if (!parent) return;
+  const children = questions.filter(question => question.parent_id === parent.id);
+  const subIndex = children.length + 1;
+  let id = `${parent.id}_s${subIndex}`;
+  let suffix = subIndex;
+  while (questions.some(question => question.id === id)) id = `${parent.id}_s${++suffix}`;
+
+  const firstChild = children.length === 0;
+  const child = {
+    id,
+    number: `${parent.number}-(${subIndex})`,
+    question_text: firstChild ? parent.question_text : '',
+    max_score: firstChild ? Number(parent.max_score || 1) : 1,
+    model_answer: firstChild ? (parent.model_answer || '') : '',
+    scoring_elements: firstChild
+      ? (parent.scoring_elements || []).map(element => ({ ...element }))
+      : [],
+    accepted_answers: firstChild ? [...(parent.accepted_answers || [])] : [],
+    common_errors: firstChild ? [...(parent.common_errors || [])] : [],
+    core_criteria: firstChild ? [...(parent.core_criteria || [])] : [],
+    parent_id: parent.id,
+    sub_index: subIndex,
+    answer_type: firstChild ? (parent.answer_type || 'text') : 'text',
+    grading_mode: firstChild ? (parent.grading_mode || 'inherit') : 'inherit',
+    teacher_notes: '',
+  };
+  if (firstChild) {
+    parent.model_answer = '';
+    parent.scoring_elements = [];
+    parent.accepted_answers = [];
+    parent.common_errors = [];
+    parent.core_criteria = [];
+    parent.grading_mode = 'inherit';
+  }
+  questions.push(child);
   renderExamQuestions();
 }
 
 function removeExamQuestion(index) {
-  currentProject.exam.questions.splice(index, 1);
+  const questions = currentProject.exam.questions;
+  const question = questions[index];
+  if (!question) return;
+  const childCount = questions.filter(item => item.parent_id === question.id).length;
+  if (childCount && !confirm(`${question.number}번 대문항과 소문항 ${childCount}개를 모두 삭제할까요?`)) return;
+  currentProject.exam.questions = questions.filter(
+    item => item.id !== question.id && item.parent_id !== question.id
+  );
   renderExamQuestions();
 }
 
@@ -645,6 +907,7 @@ function applyRubricSynthesis() {
     if ((d.accepted_answers || []).length) q.accepted_answers = d.accepted_answers;
     if ((d.common_errors || []).length) q.common_errors = d.common_errors;
   }
+  pendingCriteriaSource = 'synthesized';
   renderExamQuestions();
   document.getElementById('rubricSynthesisStatus').textContent =
     '✅ 문항 설정에 반영됨 - 위에서 내용을 검토한 뒤 "문항 저장"을 누르세요.';
@@ -668,6 +931,7 @@ async function compressCriteria() {
     currentProject.exam.questions = data.questions;
     currentProject.prompt_template = data.prompt_template;
     renderExamQuestions();
+    await loadCriteriaVersions();
     const modeNote = data.grading_mode === 'core' ? '' : ' 채점에 쓰려면 방식을 "핵심 기준 채점"으로 바꾸세요.';
     status.textContent = `✅ ${data.updated}문항 압축 완료 - 각 문항의 핵심 확인 요소를 검토하세요.${modeNote}`;
   } catch (e) { status.textContent = `❌ ${e.message}`; }
@@ -689,6 +953,7 @@ async function examRubricFromText() {
     currentProject.exam.questions = data.questions;
     currentProject.prompt_template = data.prompt_template;
     renderExamQuestions();
+    await loadCriteriaVersions();
     document.getElementById('examRubricTextInput').value = '';
     status.textContent = `✅ ${data.questions.length}문항 ${data.mode === 'revise' ? '수정' : '생성'} 완료 - 아래에서 검토하세요. (이미 저장됨)`;
   } catch (e) { status.textContent = `❌ ${e.message}`; }
@@ -738,6 +1003,7 @@ async function extractExamRubricFromFile(input) {
     currentProject.total_max_score = data.total_max_score;
     currentProject.prompt_template = data.prompt_template;
     renderExamQuestions();
+    await loadCriteriaVersions();
     status.textContent = `✅ 공식 기준표 ${data.questions.length}문항 적용 완료 - 아래에서 검토·편집하세요.`;
     return true;
   } catch (error) {
@@ -783,6 +1049,7 @@ async function generateExamRubric(preferSplitAnswers = false) {
   currentProject.total_max_score = data.total_max_score;
   currentProject.prompt_template = data.prompt_template;
   renderExamQuestions();
+  await loadCriteriaVersions();
   const sourceText = data.used_split_answers
     ? ` · 학생 답지 ${data.source_files_checked?.length || 1}개 비교`
     : (data.audit_performed ? ' · 누락 검증 완료' : '');
@@ -939,7 +1206,10 @@ async function autoGeneratePrompt(statusEl, statusMsg) {
     await fetch(`/api/projects/${currentProject.id}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ categories: currentProject.categories }),
+      body: JSON.stringify({
+        categories: currentProject.categories,
+        criteria_change_source: pendingCriteriaSource || 'manual',
+      }),
     });
     const res = await fetch(`/api/projects/${currentProject.id}/generate-prompt`, { method: 'POST' });
     const data = await res.json();
@@ -984,6 +1254,7 @@ async function extractRubricFromFile(input) {
     } else {
       currentProject.categories = data.categories;
     }
+    pendingCriteriaSource = 'official';
     
     // 프롬프트도 추출 결과에 있으면 반영, 아니면 자동 생성
     if (data.prompt_template) {
@@ -1046,6 +1317,7 @@ async function generateRubricFromText() {
     } else {
       currentProject.categories = data.categories;
     }
+    pendingCriteriaSource = 'generated';
     
     renderRubric();
     const totalCriteria = data.categories.reduce((s, c) => s + c.criteria.length, 0);
@@ -1735,6 +2007,21 @@ async function showDetail(teamNum, round) {
   openModal('detailModal');
 }
 
+function getScoredExamQuestions() {
+  const questions = currentProject?.exam?.questions || [];
+  const parentIds = new Set(questions.filter(question => question.parent_id).map(question => question.parent_id));
+  const indexed = questions.map((question, index) => ({ question, index }));
+  const ordered = [];
+  for (const item of indexed.filter(item => !item.question.parent_id)) {
+    ordered.push(item.question);
+    ordered.push(...indexed
+      .filter(child => child.question.parent_id === item.question.id)
+      .sort((a, b) => (a.question.sub_index || 0) - (b.question.sub_index || 0))
+      .map(child => child.question));
+  }
+  return ordered.filter(question => !parentIds.has(question.id));
+}
+
 function renderDetail(isEdit = false) {
   const data = currentDetailData;
   const teamNum = data.team_number;
@@ -1759,7 +2046,7 @@ function renderDetail(isEdit = false) {
     : '<table><thead><tr><th>영역</th><th>항목</th><th>점수</th><th>채점 근거</th></tr></thead><tbody>';
 
   if (isExam) {
-    for (const q of (currentProject.exam?.questions || [])) {
+    for (const q of getScoredExamQuestions()) {
       const score = data[q.id] ?? '';
       const reason = data[q.id + '_reason'] || '';
       const summary = data[q.id + '_answer_summary'] || '';

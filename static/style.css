@@ -187,3 +187,29 @@ tr.clickable{cursor:pointer}
   .submission-file-row{grid-template-columns:1fr}
   .submission-file-actions{justify-content:flex-start}
 }
+
+/* 평가기준 통합 */
+.criteria-version-card{border-color:rgba(129,140,248,.35);background:linear-gradient(135deg,rgba(99,102,241,.08),var(--surface))}
+.criteria-state-badge{display:inline-flex;align-items:center;padding:6px 12px;border-radius:999px;background:var(--surface3);color:var(--text2);font-size:.78rem;font-weight:700;white-space:nowrap}
+.criteria-state-badge.state-approved{background:rgba(52,211,153,.17);color:var(--success)}
+.criteria-state-badge.state-generated,.criteria-state-badge.state-modified,.criteria-state-badge.state-draft{background:rgba(251,191,36,.15);color:var(--warning)}
+.criteria-validation{display:grid;gap:6px;margin:4px 0 14px;font-size:.8rem}
+.criteria-error{color:var(--danger)}
+.criteria-warning{color:var(--warning)}
+.criteria-ok{color:var(--success)}
+.criteria-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.criteria-prompt-preview{margin-top:14px;padding:16px;max-height:420px;overflow:auto;white-space:pre-wrap;background:var(--bg);border:1px solid var(--border);border-radius:9px;color:var(--text);font-family:'Consolas',monospace;font-size:.76rem;line-height:1.55}
+.criteria-detail-editor{margin-top:12px;border-top:1px solid var(--border);padding-top:10px}
+.criteria-detail-editor summary{cursor:pointer;color:var(--accent);font-size:.8rem;font-weight:700;margin-bottom:10px}
+.exam-question-card{background:var(--surface2)!important}
+.exam-question-group{border-color:rgba(129,140,248,.45);background:rgba(99,102,241,.07)!important}
+.exam-sub-question{margin-left:28px;border-left:3px solid var(--primary)}
+.exam-question-header{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+.exam-question-header input,.exam-question-header select{padding:7px 9px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:inherit;font-size:.8rem}
+.question-kind{font-size:.7rem;font-weight:700;color:var(--accent);background:rgba(34,211,238,.09);padding:4px 8px;border-radius:999px}
+.score-check{font-size:.78rem;color:var(--text2)}
+.score-check.error{color:var(--danger)}
+.score-check.success{color:var(--success)}
+@media(max-width:760px){
+  .exam-sub-question{margin-left:12px}
+}

@@ -61,7 +61,7 @@ def build_project_overview(config: ProjectConfig) -> dict:
     material_file_count = submission_summary["file_count"]
 
     if config.project_type == "exam":
-        criteria_count = len(config.exam.questions)
+        criteria_count = len(config.exam.scored_questions())
         expected_count = len(config.roster_students) or config.setup.expected_count
         criteria_label = (
             f"{criteria_count}개 문항 준비됨" if criteria_count else "문항·채점기준이 필요함"
@@ -72,6 +72,14 @@ def build_project_overview(config: ProjectConfig) -> dict:
         criteria_label = (
             f"{criteria_count}개 평가항목 준비됨" if criteria_count else "평가기준이 필요함"
         )
+
+    if criteria_count:
+        if config.criteria_state.status == "approved":
+            criteria_label += f" · v{config.criteria_state.approved_version} 교사 승인"
+        elif config.criteria_state.status in {"generated", "modified", "draft"}:
+            criteria_label += " · 승인 필요"
+        elif config.criteria_state.status == "unversioned":
+            criteria_label += " · 기존 기준"
 
     rounds = _round_summaries(config.id)
     latest_round = rounds[-1] if rounds else None

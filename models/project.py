@@ -12,9 +12,11 @@ from typing import Optional
 from config import PROJECTS_DIR
 
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 WORKFLOW_TYPES = ("report", "competition", "exam")
+ANSWER_TYPES = ("short", "text", "formula", "diagram", "mixed")
+QUESTION_GRADING_MODES = ("inherit", "autonomous", "core", "strict")
 
 
 def _project_dir(project_id: str) -> Path:
@@ -93,6 +95,13 @@ class Criterion:
     description: str
     scale: list[int]  # e.g. [15, 13, 11, 9, 7]
     scale_labels: list[str]  # e.g. ["매우우수", "우수", ...]
+    # 교사용 상세 기준
+    required_elements: list[str] = field(default_factory=list)
+    deduction_rules: list[str] = field(default_factory=list)
+    exceptions: list[str] = field(default_factory=list)
+    feedback_focus: str = ""
+    # 실제 AI 전송에 사용할 압축 기준
+    core_criteria: list[str] = field(default_factory=list)
     
     @property
     def max_score(self) -> int:
@@ -134,7 +143,12 @@ class ScoringElement:
 
 @dataclass
 class ExamQuestion:
-    """정기고사 서술형 문항과 채점 기준."""
+    """정기고사 서술형 문항과 채점 기준.
+
+    다른 문항이 parent_id로 이 문항을 가리키면 대문항 묶음이 된다.
+    대문항 묶음은 공통 지문과 공식 대문항 배점을 보존하지만 직접 채점하지 않고,
+    실제 점수와 총점은 소문항(말단 문항)에서만 계산한다.
+    """
     id: str
     number: str
     question_text: str
@@ -145,6 +159,40 @@ class ExamQuestion:
     common_errors: list[str] = field(default_factory=list)
     # AI 채점용 핵심 확인 요소 (교사용 상세 기준과 분리된 압축 층)
     core_criteria: list[str] = field(default_factory=list)
+    parent_id: str = ""
+    sub_index: int = 0
+    answer_type: str = "text"
+    grading_mode: str = "inherit"
+    teacher_notes: str = ""
+
+
+def normalize_exam_questions(questions: list[ExamQuestion]) -> None:
+    """소문항 연결과 순서를 한 단계 구조로 안전하게 정규화한다."""
+    by_id = {question.id: question for question in questions}
+    for question in questions:
+        if question.parent_id == question.id or question.parent_id not in by_id:
+            question.parent_id = ""
+        if question.answer_type not in ANSWER_TYPES:
+            question.answer_type = "text"
+        if question.grading_mode not in QUESTION_GRADING_MODES:
+            question.grading_mode = "inherit"
+
+    # 소문항 아래 소문항은 최상위 부모 바로 아래로 올린다.
+    for question in questions:
+        parent = by_id.get(question.parent_id) if question.parent_id else None
+        if parent is not None and parent.parent_id:
+            question.parent_id = parent.parent_id
+
+    for parent_id in {question.parent_id for question in questions if question.parent_id}:
+        siblings = [question for question in questions if question.parent_id == parent_id]
+        ordered = sorted(
+            enumerate(siblings),
+            key=lambda item: (item[1].sub_index or 10**9, item[0]),
+        )
+        used = [question.sub_index for question in siblings]
+        if any(index <= 0 for index in used) or len(set(used)) != len(used):
+            for sub_index, (_, sibling) in enumerate(ordered, 1):
+                sibling.sub_index = sub_index
 
 
 @dataclass
@@ -196,6 +244,67 @@ class ExamConfig:
     students: list[StudentRecord] = field(default_factory=list)
     scan_split: ScanSplitConfig = field(default_factory=ScanSplitConfig)
 
+    def top_level_questions(self) -> list[ExamQuestion]:
+        return [question for question in self.questions if not question.parent_id]
+
+    def children_of(self, question_id: str) -> list[ExamQuestion]:
+        return sorted(
+            [question for question in self.questions if question.parent_id == question_id],
+            key=lambda question: question.sub_index,
+        )
+
+    def ordered_questions(self) -> list[ExamQuestion]:
+        ordered = []
+        for question in self.top_level_questions():
+            ordered.append(question)
+            ordered.extend(self.children_of(question.id))
+        return ordered
+
+    def scored_questions(self) -> list[ExamQuestion]:
+        """소문항이 있는 대문항은 제외하고 실제 점수를 받는 말단 문항만 반환."""
+        parent_ids = {question.parent_id for question in self.questions if question.parent_id}
+        return [
+            question
+            for question in self.ordered_questions()
+            if question.id not in parent_ids
+        ]
+
+    def score_validation(self) -> list[dict]:
+        """대문항 공식 배점과 소문항 배점 합 불일치를 교정 가능한 경고로 반환."""
+        warnings = []
+        for parent in self.top_level_questions():
+            children = self.children_of(parent.id)
+            if not children:
+                continue
+            child_total = sum(child.max_score for child in children)
+            if parent.max_score != child_total:
+                warnings.append({
+                    "parent_id": parent.id,
+                    "number": parent.number,
+                    "parent_score": parent.max_score,
+                    "child_score": child_total,
+                    "message": (
+                        f"{parent.number}번 대문항 배점 {parent.max_score}점과 "
+                        f"소문항 합 {child_total}점이 다릅니다."
+                    ),
+                })
+        return warnings
+
+    @property
+    def scored_max_score(self) -> int:
+        return sum(question.max_score for question in self.scored_questions())
+
+
+@dataclass
+class CriteriaState:
+    """현재 편집 중인 평가기준과 승인된 버전의 연결 상태."""
+    active_version: int = 0
+    approved_version: int = 0
+    status: str = "unversioned"  # empty | unversioned | generated | modified | draft | approved
+    source: str = ""
+    updated_at: str = ""
+    delivery_mode: str = "strict"  # 보고서: core | strict
+
 
 @dataclass
 class ProjectSetup:
@@ -237,6 +346,7 @@ class ProjectConfig:
     
     # 채점 기준
     categories: list[Category] = field(default_factory=list)
+    criteria_state: CriteriaState = field(default_factory=CriteriaState)
 
     # 정기고사 설정
     exam: ExamConfig = field(default_factory=ExamConfig)
@@ -256,7 +366,7 @@ class ProjectConfig:
 
     @property
     def all_exam_questions(self) -> list[ExamQuestion]:
-        return list(self.exam.questions)
+        return list(self.exam.scored_questions())
 
     @property
     def roster_students(self) -> list[StudentRecord]:
@@ -295,6 +405,7 @@ class ProjectConfig:
             "temperature": self.temperature,
             "materials": asdict(self.materials),
             "submissions": submissions_data,
+            "criteria_state": asdict(self.criteria_state),
             "categories": [
                 {
                     "name": cat.name,
@@ -344,7 +455,36 @@ class ProjectConfig:
         for cat_idx, cat_data in enumerate(data.get("categories", [])):
             criteria = []
             for c_data in cat_data.get("criteria", []):
-                c = Criterion(**c_data)
+                c = Criterion(
+                    id=str(c_data.get("id", "")),
+                    name=str(c_data.get("name", "")),
+                    description=str(c_data.get("description", c_data.get("name", ""))),
+                    scale=[int(value) for value in c_data.get("scale", [5, 4, 3, 2, 1])],
+                    scale_labels=[str(value) for value in c_data.get(
+                        "scale_labels", ["매우우수", "우수", "보통", "미흡", "매우미흡"]
+                    )],
+                    required_elements=[
+                        str(value).strip()
+                        for value in c_data.get("required_elements", [])
+                        if str(value).strip()
+                    ],
+                    deduction_rules=[
+                        str(value).strip()
+                        for value in c_data.get("deduction_rules", [])
+                        if str(value).strip()
+                    ],
+                    exceptions=[
+                        str(value).strip()
+                        for value in c_data.get("exceptions", [])
+                        if str(value).strip()
+                    ],
+                    feedback_focus=str(c_data.get("feedback_focus", "")),
+                    core_criteria=[
+                        str(value).strip()
+                        for value in c_data.get("core_criteria", [])
+                        if str(value).strip()
+                    ],
+                )
                 # 중복 ID 자동 보정: cat인덱스_원래ID
                 if c.id in used_ids:
                     c.id = f"cat{cat_idx + 1}_{c.id}"
@@ -378,7 +518,22 @@ class ProjectConfig:
                 accepted_answers=list(q_data.get("accepted_answers", [])),
                 common_errors=list(q_data.get("common_errors", [])),
                 core_criteria=[str(v).strip() for v in q_data.get("core_criteria", []) if str(v).strip()],
+                parent_id=str(q_data.get("parent_id", "") or ""),
+                sub_index=max(0, int(q_data.get("sub_index", 0) or 0)),
+                answer_type=(
+                    str(q_data.get("answer_type", "text") or "text")
+                    if str(q_data.get("answer_type", "text") or "text") in ANSWER_TYPES
+                    else "text"
+                ),
+                grading_mode=(
+                    str(q_data.get("grading_mode", "inherit") or "inherit")
+                    if str(q_data.get("grading_mode", "inherit") or "inherit")
+                    in QUESTION_GRADING_MODES
+                    else "inherit"
+                ),
+                teacher_notes=str(q_data.get("teacher_notes", "")),
             ))
+        normalize_exam_questions(exam_questions)
 
         def parse_students(raw_students: list[dict]) -> list[StudentRecord]:
             return [
@@ -448,6 +603,30 @@ class ProjectConfig:
             manual_links=manual_links,
             split_output_dir=str(submissions_data.get("split_output_dir", "")),
         )
+
+        criteria_state_data = data.get("criteria_state", {}) or {}
+        has_criteria = bool(categories or exam_questions)
+        criteria_status = str(
+            criteria_state_data.get(
+                "status", "unversioned" if has_criteria else "empty"
+            )
+        )
+        if criteria_status not in {
+            "empty", "unversioned", "generated", "modified", "draft", "approved"
+        }:
+            criteria_status = "unversioned" if has_criteria else "empty"
+        criteria_state = CriteriaState(
+            active_version=max(0, int(criteria_state_data.get("active_version", 0) or 0)),
+            approved_version=max(0, int(criteria_state_data.get("approved_version", 0) or 0)),
+            status=criteria_status,
+            source=str(criteria_state_data.get("source", "")),
+            updated_at=str(criteria_state_data.get("updated_at", "")),
+            delivery_mode=(
+                str(criteria_state_data.get("delivery_mode", "strict"))
+                if str(criteria_state_data.get("delivery_mode", "strict")) in {"core", "strict"}
+                else "strict"
+            ),
+        )
         
         provider_aliases = {
             "google": "gemini_api",
@@ -489,6 +668,7 @@ class ProjectConfig:
             temperature=data.get("temperature", 0.2),
             materials=materials,
             submissions=submissions,
+            criteria_state=criteria_state,
             categories=categories,
             exam=exam,
             prompt_template=data.get("prompt_template", ""),
@@ -640,7 +820,19 @@ def generate_default_prompt(config: ProjectConfig) -> str:
         for c in cat.criteria:
             scale_header = " | ".join(c.scale_labels) if c.scale_labels else ""
             scale_values = " | ".join(str(s) for s in c.scale)
-            lines.append(f"- **{c.name}**: {c.description}")
+            lines.append(f"- **{c.name}**")
+            if config.criteria_state.delivery_mode == "core" and c.core_criteria:
+                lines.append("  - AI 핵심 기준: " + "; ".join(c.core_criteria))
+            else:
+                lines.append(f"  - 상세 기준: {c.description}")
+                if c.required_elements:
+                    lines.append("  - 필수 확인 요소: " + "; ".join(c.required_elements))
+                if c.deduction_rules:
+                    lines.append("  - 감점 규칙: " + "; ".join(c.deduction_rules))
+                if c.exceptions:
+                    lines.append("  - 예외·인정 기준: " + "; ".join(c.exceptions))
+                if c.feedback_focus.strip():
+                    lines.append(f"  - 피드백 관점: {c.feedback_focus.strip()}")
             lines.append(f"  - 척도: {scale_header}")
             lines.append(f"  - 배점: {scale_values}")
         lines.append("")
@@ -703,16 +895,49 @@ def generate_exam_prompt(config: ProjectConfig) -> str:
         "## 문항별 채점 기준",
     ]
 
-    for q in config.exam.questions:
+    answer_type_labels = {
+        "short": "단답형",
+        "text": "문장 서술형",
+        "formula": "수식·계산형",
+        "diagram": "그래프·도식형",
+        "mixed": "복합형",
+    }
+    parent_ids = {
+        question.parent_id for question in config.exam.questions if question.parent_id
+    }
+    used_modes = set()
+    for q in config.exam.ordered_questions():
+        if q.id in parent_ids:
+            children = config.exam.children_of(q.id)
+            child_total = sum(child.max_score for child in children)
+            lines.extend([
+                "",
+                f"### {q.number}번 대문항 묶음 (공식 {q.max_score}점, 소문항 합 {child_total}점)",
+            ])
+            if q.question_text.strip():
+                lines.append(f"공통 지문·조건: {q.question_text}")
+            lines.append("이 대문항은 직접 점수를 출력하지 말고 아래 소문항만 각각 채점하세요.")
+            continue
+
+        question_mode = q.grading_mode if q.grading_mode != "inherit" else mode
+        used_modes.add(question_mode)
+        parent = next(
+            (candidate for candidate in config.exam.questions if candidate.id == q.parent_id),
+            None,
+        )
         lines.extend([
             "",
-            f"### {q.number}번 ({q.max_score}점)",
+            (
+                f"### {q.number}번 ({q.max_score}점)"
+                + (f" — {parent.number}번의 소문항" if parent else "")
+            ),
         ])
+        lines.append(f"답안 유형: {answer_type_labels.get(q.answer_type, '문장 서술형')}")
         if q.question_text.strip():
             lines.append(f"문제: {q.question_text}")
         lines.append(f"모범 답안: {q.model_answer or '교사가 아직 입력하지 않음'}")
 
-        if mode == "strict":
+        if question_mode == "strict":
             lines.append("부분점 요소:")
             if q.scoring_elements:
                 for element in q.scoring_elements:
@@ -728,7 +953,7 @@ def generate_exam_prompt(config: ProjectConfig) -> str:
                 lines.append("허용 답안: " + "; ".join(q.accepted_answers))
             if q.common_errors:
                 lines.append("주요 감점 사례: " + "; ".join(q.common_errors))
-        elif mode == "core":
+        elif question_mode == "core":
             if q.core_criteria:
                 lines.append("핵심 확인 요소:")
                 for item in q.core_criteria:
@@ -744,13 +969,13 @@ def generate_exam_prompt(config: ProjectConfig) -> str:
                 "채점 근거에 그 기준을 남기세요."
             )
 
-    if mode == "strict":
+    if "strict" in used_modes:
         lines.extend([
             "",
             "위 부분점 기준에 명시되지 않은 방식의 답이나 기준을 벗어나는 답은 "
             "점수를 추정하지 말고 review_required를 true로 표시하세요.",
         ])
-    elif mode == "core":
+    if "core" in used_modes:
         lines.extend([
             "",
             "핵심 확인 요소를 중심으로 채점하되, 요소에 없는 타당한 풀이는 모범답안과 배점을 "

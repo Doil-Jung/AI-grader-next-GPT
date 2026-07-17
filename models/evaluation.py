@@ -16,7 +16,7 @@ def build_evaluation_model(config: ProjectConfig) -> type[BaseModel]:
     }
     
     if config.project_type == "exam":
-        for question in config.exam.questions:
+        for question in config.exam.scored_questions():
             # 점수보다 먼저 답의 존재 여부를 판정하게 해 환각 부분점수를 차단한다.
             fields[f"{question.id}_has_answer"] = (
                 bool,
@@ -93,7 +93,8 @@ def compute_scores(config: ProjectConfig, eval_data: dict) -> dict:
     if config.project_type == "exam":
         # 답이 없다고 판정된 문항은 모델이 점수를 주었더라도 0점으로 강제한다.
         # 프롬프트 지시(부탁)와 달리 코드 수준에서 환각 부분점수를 차단한다.
-        for q in config.exam.questions:
+        scored_questions = config.exam.scored_questions()
+        for q in scored_questions:
             has_key = f"{q.id}_has_answer"
             if has_key in result and not bool(result.get(has_key)):
                 original_score = int(result.get(q.id, 0) or 0)
@@ -104,11 +105,11 @@ def compute_scores(config: ProjectConfig, eval_data: dict) -> dict:
                 if original_score:
                     note += f" AI가 제시했던 {original_score}점은 무효화됨."
                 result[f"{q.id}_reason"] = note
-        total = sum(int(result.get(q.id, 0) or 0) for q in config.exam.questions)
+        total = sum(int(result.get(q.id, 0) or 0) for q in scored_questions)
         result["total_score"] = total
         result["ai_total_score"] = total
         result["review_required_count"] = sum(
-            1 for q in config.exam.questions if bool(result.get(f"{q.id}_review_required", False))
+            1 for q in scored_questions if bool(result.get(f"{q.id}_review_required", False))
         )
         result.setdefault("teacher_status", "pending")
         result.setdefault("teacher_note", "")
