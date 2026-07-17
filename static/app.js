@@ -48,7 +48,10 @@ function showTab(name) {
   if (name === 'analysis') {
     loadRoundsForAnalysis();
     loadFeedbackExportPreview();
-    if (currentProject?.workflow_type === 'competition') loadRounds('subRound', () => loadSubmission());
+    if (currentProject?.workflow_type === 'competition') {
+      loadCompetitionState();
+      loadRounds('subRound', () => loadSubmission());
+    }
   }
   if (name === 'materials') scanMaterials();
   if (name === 'grading') {
@@ -3359,195 +3362,391 @@ async function downloadFeedbackExport() {
   }
 }
 
-// ═══ 제출용 ═══
-let previewResults = null;  // 미리보기 결과 저장
+// ═══ 대회 순위 조정 ═══
+let previewResults = null;
+let competitionState = null;
+let dragIdx = null;
+
+function competitionAllowedScores() {
+  return (document.getElementById('competitionAllowedScores')?.value || '')
+    .split(',')
+    .map(value => Number(value.trim()))
+    .filter(Number.isFinite);
+}
+
+function competitionTeamsPayload() {
+  return submissionData.map(item => ({
+    team_number: item.team_number,
+    tie_with_previous: Boolean(item.tie_with_previous),
+    override_score: item.override_score === '' ? null : item.override_score,
+    exception_reason: item.exception_reason || '',
+  }));
+}
+
+async function loadCompetitionState() {
+  if (!currentProject || currentProject.workflow_type !== 'competition') return;
+  const response = await fetch(`/api/projects/${currentProject.id}/competition-ranking`);
+  const data = await response.json();
+  const status = document.getElementById('competitionSavedStatus');
+  if (!response.ok) {
+    status.textContent = data.error || '순위 조정 이력을 불러오지 못했습니다.';
+    return;
+  }
+  competitionState = data;
+  const allowedInput = document.getElementById('competitionAllowedScores');
+  if (allowedInput && !allowedInput.value) {
+    allowedInput.value = (data.current?.allowed_scores || data.default_allowed_scores || []).join(', ');
+  }
+  if (data.current) {
+    status.innerHTML = `<strong>확정 v${data.current.version} · ${data.current.source_round}회차 기준</strong>` +
+      ` · ${data.current.summary.team_count}팀 · 점수 변경 ${data.current.summary.changed_score_count}팀` +
+      `${data.current_stale ? '<br><span class="criteria-error">원 평가 결과가 확정 뒤 변경되어 다시 확정해야 합니다.</span>' : ''}`;
+  } else {
+    status.textContent = '아직 교사가 확정한 순위 조정안이 없습니다.';
+  }
+  document.getElementById('btnExportExcel').disabled = !data.current || data.current_stale;
+  renderCompetitionHistory(data.history || []);
+}
+
+function renderCompetitionHistory(history) {
+  const container = document.getElementById('competitionHistory');
+  if (!container) return;
+  if (!history.length) {
+    container.innerHTML = '';
+    return;
+  }
+  container.innerHTML = `<h3>확정 변경 이력</h3>
+    <div class="competition-history-list">${[...history].reverse().map(item => `
+      <div>
+        <strong>v${item.version}</strong>
+        <span>${item.source_round}회차 · ${formatDateTime(item.approved_at)}</span>
+        <small>공동순위 ${item.summary?.tie_team_count || 0}팀 · 수동 예외 ${item.summary?.manual_exception_count || 0}팀 · 점수 변경 ${item.summary?.changed_score_count || 0}팀</small>
+        ${item.approval_note ? `<p>${esc(item.approval_note)}</p>` : ''}
+      </div>`).join('')}</div>`;
+}
 
 async function loadSubmission() {
   if (!currentProject) return;
-  const round = document.getElementById('subRound').value;
-  const res = await fetch(`/api/projects/${currentProject.id}/results?round=${round}`);
-  submissionData = await res.json();
+  const round = Number(document.getElementById('subRound').value);
+  if (!round) return;
+  const response = await fetch(`/api/projects/${currentProject.id}/results?round=${round}`);
+  const results = await response.json();
+  if (!response.ok || !Array.isArray(results)) {
+    alert(results.error || '원 평가 결과를 불러오지 못했습니다.');
+    return;
+  }
+  submissionData = results.map(result => ({
+    team_number: result.team_number,
+    team_name: result.team_name,
+    evaluation_score: result.total_score,
+    tie_with_previous: false,
+    override_score: null,
+    exception_reason: '',
+  }));
   previewResults = null;
-  document.getElementById('btnExportExcel').disabled = true;
+  document.getElementById('btnApproveCompetition').disabled = true;
   document.getElementById('submissionPreview').innerHTML = '';
   renderSubmission();
 }
 
-async function loadAllTeamsSubmission() {
-  if (!currentProject) return;
-  const res = await fetch(`/api/projects/${currentProject.id}/materials`);
-  const data = await res.json();
-  if (!data.participants?.length) return alert('심사자료가 없습니다. 심사자료 탭에서 폴더를 지정하세요.');
-  
-  submissionData = data.participants.map(p => ({
-    team_number: p.number,
-    team_name: p.name,
-    total_score: null
-  }));
-  previewResults = null;
-  document.getElementById('btnExportExcel').disabled = true;
-  document.getElementById('submissionPreview').innerHTML = '';
-  renderSubmission();
+function competitionDisplayRanks() {
+  let rank = 1;
+  let groupStart = 0;
+  return submissionData.map((item, index) => {
+    if (index === 0 || !item.tie_with_previous) {
+      rank = index + 1;
+      groupStart = index;
+    }
+    return { rank, groupStart };
+  });
 }
 
 function renderSubmission() {
   const tbody = document.getElementById('submissionBody');
-  tbody.innerHTML = submissionData.map((r, i) => {
-    const val = r.total_score != null ? r.total_score : '';
-    return `
-    <tr draggable="true" ondragstart="dragStart(event,${i})" ondragover="dragOver(event)" ondrop="drop(event,${i})">
-      <td class="drag-handle">☰</td><td>${i + 1}</td><td>${r.team_number}</td><td>${esc(r.team_name || '')}</td>
-      <td>${r.total_score ?? '-'}</td>
-      <td><input type="number" value="${val}" min="0"
-        style="width:80px;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:4px 8px;color:var(--text)"
-        onchange="validateAndSetScore(${i}, this)"></td>
-    </tr>`;
-  }).join('');
+  const ranks = competitionDisplayRanks();
+  tbody.innerHTML = submissionData.map((item, index) => `
+    <tr draggable="true" ondragstart="dragStart(event,${index})" ondragover="dragOver(event)" ondrop="drop(event,${index})">
+      <td class="drag-handle">☰</td>
+      <td>${ranks[index].rank}위</td>
+      <td><label class="tie-check"><input type="checkbox" ${item.tie_with_previous ? 'checked' : ''} ${index === 0 ? 'disabled' : ''} onchange="setCompetitionTie(${index},this.checked)"> 위와 공동</label></td>
+      <td>${item.team_number}</td>
+      <td>${esc(item.team_name || '')}</td>
+      <td><strong>${reviewScore(item.evaluation_score)}</strong></td>
+      <td><input class="competition-score-input" type="number" min="0" step="0.1" value="${item.override_score ?? ''}" placeholder="자동" onchange="setCompetitionField(${index},'override_score',this.value)"></td>
+      <td><input class="competition-reason-input" value="${escAttr(item.exception_reason || '')}" placeholder="직접 변경 시 필수" oninput="setCompetitionField(${index},'exception_reason',this.value)"></td>
+    </tr>`).join('');
 }
 
-function validateAndSetScore(index, inputEl) {
-  const val = inputEl.value.trim();
-  if (val === '') {
-    submissionData[index].total_score = null;
-    renderSubmission();
-    return;
-  }
-  const score = Number(val);
-  if (isNaN(score)) { inputEl.value = ''; return; }
-  
-  // 위쪽(고순위) 팀 중 고정 점수가 있으면, 그보다 높으면 안 됨
-  for (let i = index - 1; i >= 0; i--) {
-    if (submissionData[i].total_score != null) {
-      if (score > submissionData[i].total_score) {
-        alert(`${index + 1}위의 점수(${score})가 ${i + 1}위(${submissionData[i].total_score}점)보다 높을 수 없습니다.`);
-        inputEl.value = submissionData[index].total_score ?? '';
-        return;
-      }
-      break;
-    }
-  }
-  // 아래쪽(저순위) 팀 중 고정 점수가 있으면, 그보다 낮으면 안 됨
-  for (let i = index + 1; i < submissionData.length; i++) {
-    if (submissionData[i].total_score != null) {
-      if (score < submissionData[i].total_score) {
-        alert(`${index + 1}위의 점수(${score})가 ${i + 1}위(${submissionData[i].total_score}점)보다 낮을 수 없습니다.`);
-        inputEl.value = submissionData[index].total_score ?? '';
-        return;
-      }
-      break;
-    }
-  }
-  
-  submissionData[index].total_score = score;
-  renderSubmission();
-}
-
-let dragIdx = null;
-function dragStart(e, i) { dragIdx = i; e.dataTransfer.effectAllowed = 'move'; }
-function dragOver(e) { e.preventDefault(); }
-function drop(e, i) {
-  e.preventDefault();
-  if (dragIdx === null) return;
-  const item = submissionData.splice(dragIdx, 1)[0];
-  submissionData.splice(i, 0, item);
-  dragIdx = null;
-  // 드래그 후 고정 점수가 순위에 어긋나면 초기화
-  for (let k = 1; k < submissionData.length; k++) {
-    const prev = submissionData[k - 1].total_score;
-    const curr = submissionData[k].total_score;
-    if (prev != null && curr != null && curr > prev) {
-      submissionData[k].total_score = null;
-    }
-  }
+function setCompetitionTie(index, checked) {
+  submissionData[index].tie_with_previous = index > 0 && checked;
   previewResults = null;
-  document.getElementById('btnExportExcel').disabled = true;
+  document.getElementById('btnApproveCompetition').disabled = true;
   document.getElementById('submissionPreview').innerHTML = '';
   renderSubmission();
 }
 
-async function previewSubmission() {
-  if (!currentProject || !submissionData.length) return alert('먼저 팀을 불러오세요.');
-  
-  // 입력 필드 값 최신화
-  const inputs = document.querySelectorAll('#submissionBody input[type="number"]');
-  inputs.forEach((inp, i) => {
-    submissionData[i].total_score = inp.value === '' ? null : Number(inp.value);
-  });
-  
-  const teams = submissionData.map((r, i) => ({
-    team_number: r.team_number,
-    team_name: r.team_name,
-    total_score: r.total_score
-  }));
-  
+function setCompetitionField(index, field, value) {
+  submissionData[index][field] = field === 'override_score'
+    ? (value === '' ? null : Number(value))
+    : value;
+  previewResults = null;
+  document.getElementById('btnApproveCompetition').disabled = true;
+}
+
+function dragStart(event, index) {
+  dragIdx = index;
+  event.dataTransfer.effectAllowed = 'move';
+}
+function dragOver(event) { event.preventDefault(); }
+function drop(event, index) {
+  event.preventDefault();
+  if (dragIdx === null || dragIdx === index) return;
+  const [item] = submissionData.splice(dragIdx, 1);
+  item.tie_with_previous = false;
+  submissionData.splice(index, 0, item);
+  submissionData[0].tie_with_previous = false;
+  dragIdx = null;
+  previewResults = null;
+  document.getElementById('btnApproveCompetition').disabled = true;
+  document.getElementById('submissionPreview').innerHTML = '';
+  renderSubmission();
+}
+
+function renderCompetitionPreview(plan, title = '자동 배정 미리보기') {
   const preview = document.getElementById('submissionPreview');
-  preview.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text2)">⏳ 채점표 생성 중...</div>';
-  
+  const summary = plan.summary || {};
+  preview.innerHTML = `<h3>${esc(title)}</h3>
+    <div class="review-summary-strip">
+      <span>팀 <strong>${summary.team_count || 0}</strong></span>
+      <span>순위 그룹 <strong>${summary.rank_group_count || 0}</strong></span>
+      <span>공동순위 팀 <strong>${summary.tie_team_count || 0}</strong></span>
+      <span>수동 예외 <strong>${summary.manual_exception_count || 0}</strong></span>
+      <span>원점수와 달라짐 <strong>${summary.changed_score_count || 0}</strong></span>
+    </div>
+    <div class="table-wrap"><table><thead><tr>
+      <th>최종 순위</th><th>공동</th><th>번호</th><th>이름</th>
+      <th>원 평가점수</th><th>자동 배정</th><th>최종 배정</th><th>변화</th><th>예외 사유</th>
+    </tr></thead><tbody>${(plan.entries || []).map(entry => `
+      <tr>
+        <td><strong>${entry.rank}위</strong></td><td>${entry.tie ? '공동' : ''}</td>
+        <td>${entry.team_number}</td><td>${esc(entry.team_name || '')}</td>
+        <td>${reviewScore(entry.evaluation_score)}</td><td>${reviewScore(entry.auto_final_score)}</td>
+        <td><strong>${reviewScore(entry.final_score)}</strong></td>
+        <td>${entry.score_change == null ? '-' : `${entry.score_change > 0 ? '+' : ''}${reviewScore(entry.score_change)}`}</td>
+        <td>${esc(entry.exception_reason || '')}</td>
+      </tr>`).join('')}</tbody></table></div>`;
+}
+
+async function previewSubmission() {
+  if (!currentProject || !submissionData.length) return alert('먼저 원 평가 결과를 불러오세요.');
+  const sourceRound = Number(document.getElementById('subRound').value);
+  const allowedScores = competitionAllowedScores();
+  if (!allowedScores.length) return alert('허용 최종 점수를 쉼표로 구분해 입력하세요.');
+  const preview = document.getElementById('submissionPreview');
+  preview.innerHTML = '<div class="review-loading">순위와 최종 점수를 계산하는 중입니다.</div>';
   try {
-    const res = await fetch(`/api/projects/${currentProject.id}/submission/preview`, {
+    const response = await fetch(`/api/projects/${currentProject.id}/competition-ranking/preview`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ teams })
+      body: JSON.stringify({
+        source_round: sourceRound,
+        teams: competitionTeamsPayload(),
+        allowed_scores: allowedScores,
+      }),
     });
-    if (!res.ok) {
-      const err = await res.json();
-      preview.innerHTML = `<div style="color:var(--danger)">${err.error || '오류 발생'}</div>`;
-      return;
-    }
-    const data = await res.json();
-    previewResults = data.results;
-    const cats = data.categories;
-    
-    // 미리보기 테이블 렌더링
-    let html = '<h3 style="margin-bottom:12px">📋 생성된 채점표 미리보기</h3>';
-    html += '<div class="table-wrap"><table><thead><tr>';
-    html += '<th>순위</th><th>번호</th><th>이름</th>';
-    for (const cat of cats) {
-      for (const c of cat.criteria) {
-        html += `<th>${esc(c.name)}<br><small>(${c.max_score})</small></th>`;
-      }
-      html += `<th style="font-weight:700">${esc(cat.name)}<br>소계</th>`;
-    }
-    html += '<th style="font-weight:700">합계</th></tr></thead><tbody>';
-    
-    for (const r of previewResults) {
-      html += `<tr><td>${r.rank}</td><td>${r.team_number}</td><td>${esc(r.team_name || '')}</td>`;
-      for (const cat of cats) {
-        for (const c of cat.criteria) {
-          html += `<td>${r[c.id] ?? '-'}</td>`;
-        }
-        const catKey = cat.name.replace(/ /g, '_') + '_total';
-        html += `<td style="font-weight:700">${r[catKey] ?? '-'}</td>`;
-      }
-      html += `<td style="font-weight:700">${r.total_score ?? '-'}</td></tr>`;
-    }
-    html += '</tbody></table></div>';
-    preview.innerHTML = html;
-    
-    document.getElementById('btnExportExcel').disabled = false;
-  } catch (e) {
-    preview.innerHTML = `<div style="color:var(--danger)">네트워크 오류: ${e.message}</div>`;
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || '순위 미리보기를 만들지 못했습니다.');
+    previewResults = data;
+    renderCompetitionPreview(data);
+    document.getElementById('btnApproveCompetition').disabled = false;
+  } catch (error) {
+    preview.innerHTML = `<div class="criteria-error">${esc(error.message)}</div>`;
   }
 }
 
-async function exportSubmissionExcel() {
-  if (!currentProject || !previewResults) return;
-  
-  const res = await fetch(`/api/projects/${currentProject.id}/submission/excel`, {
+async function approveCompetitionRanking() {
+  if (!previewResults) return alert('먼저 자동 배정 미리보기를 확인하세요.');
+  if (!confirm('현재 순위와 최종 배정점수를 교사 확정안으로 저장할까요?\\n원 평가점수는 변경되지 않습니다.')) return;
+  const response = await fetch(`/api/projects/${currentProject.id}/competition-ranking/approve`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ results: previewResults })
+    body: JSON.stringify({
+      source_round: Number(document.getElementById('subRound').value),
+      teams: competitionTeamsPayload(),
+      allowed_scores: competitionAllowedScores(),
+      approval_note: document.getElementById('competitionApprovalNote').value,
+    }),
   });
-  if (res.ok) {
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = '제출용_채점표.xlsx';
-    a.click();
-    URL.revokeObjectURL(url);
+  const data = await response.json();
+  if (!response.ok) return alert(data.error || '순위 확정에 실패했습니다.');
+  previewResults = data.current;
+  renderCompetitionPreview(data.current, `교사 확정 v${data.current.version}`);
+  document.getElementById('btnApproveCompetition').disabled = true;
+  await loadCompetitionState();
+}
+
+async function loadSavedCompetitionRanking() {
+  await loadCompetitionState();
+  const current = competitionState?.current;
+  if (!current) return alert('저장된 확정안이 없습니다.');
+  document.getElementById('subRound').value = String(current.source_round);
+  document.getElementById('competitionAllowedScores').value = current.allowed_scores.join(', ');
+  document.getElementById('competitionApprovalNote').value = current.approval_note || '';
+  submissionData = current.entries.map((entry, index, entries) => ({
+    team_number: entry.team_number,
+    team_name: entry.team_name,
+    evaluation_score: entry.evaluation_score,
+    tie_with_previous: index > 0 && entry.rank === entries[index - 1].rank,
+    override_score: entry.manual_exception ? entry.final_score : null,
+    exception_reason: entry.exception_reason || '',
+  }));
+  previewResults = current;
+  renderSubmission();
+  renderCompetitionPreview(current, `저장된 교사 확정 v${current.version}`);
+  document.getElementById('btnApproveCompetition').disabled = true;
+}
+
+async function exportSubmissionExcel() {
+  if (!currentProject || !competitionState?.current || competitionState.current_stale) {
+    return alert('변경되지 않은 교사 확정안이 있어야 Excel을 만들 수 있습니다.');
+  }
+  const response = await fetch(`/api/projects/${currentProject.id}/competition-ranking/excel`);
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    return alert(data.error || '확정 순위표 Excel 생성에 실패했습니다.');
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = '대회_최종순위표.xlsx';
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+// ═══ 첫 실행·화면별 도움말 ═══
+const HELP_BY_TAB = {
+  projects: {
+    title: '프로젝트 시작',
+    description: '가장 가까운 평가 유형을 선택해 새 프로젝트를 만듭니다.',
+    steps: ['처음이면 가상 샘플로 전체 흐름을 먼저 확인합니다.', '보고서·대회·정기고사 서술형 중 하나를 선택합니다.', '프로젝트를 만든 뒤 개요의 다음 작업 버튼을 따릅니다.'],
+  },
+  overview: {
+    title: '개요와 다음 작업',
+    description: '준비 상태, 독립 채점 회차와 교사 확정 진행률을 확인합니다.',
+    steps: ['상단 진행률과 다음 할 일을 확인합니다.', '준비 카드에서 문제가 있는 단계로 바로 이동합니다.', '전체 대상 독립 채점 2회와 교사 확정 완료 여부를 확인합니다.'],
+  },
+  settings: {
+    title: '보고서·대회 평가기준',
+    description: '공식 루브릭을 반영하거나 자동 초안을 만든 뒤 교사가 승인합니다.',
+    steps: ['공식 기준 파일 또는 간단한 평가 설명을 입력합니다.', '항목·척도·상세 기준과 AI용 핵심 기준을 검토합니다.', '저장 버전을 만든 뒤 교사 승인합니다.'],
+  },
+  exam: {
+    title: '서술형 문항과 채점기준',
+    description: '문제·정답·기준을 대문항과 소문항 구조로 정리합니다.',
+    steps: ['문제지와 기준표가 있으면 함께 올립니다.', '소문항 배점 합과 모범답안·부분점 요소를 확인합니다.', 'AI 전달 수준을 선택하고 기준 버전을 승인합니다.'],
+  },
+  materials: {
+    title: '학생·답안 준비',
+    description: '명렬, 통합 스캔 분할과 학생별 파일 연결을 한 화면에서 처리합니다.',
+    steps: ['실제 스캔 순서대로 명렬을 저장합니다.', '통합 PDF는 분할 미리보기에서 쪽 범위를 먼저 확인합니다.', '파일 없음·이름 불일치·여러 파일 상태를 모두 해결합니다.'],
+  },
+  grading: {
+    title: 'AI 독립 채점',
+    description: '공급자·모델·기준 버전을 고정한 독립 회차를 실행합니다.',
+    steps: ['대상·예상 요청 수·시간·비용을 확인합니다.', '기본 독립 채점 2회를 실행합니다.', '중단되면 성공 결과를 보존한 채 이어하거나 실패 학생만 재시도합니다.'],
+  },
+  results: {
+    title: '교사 검토와 최종 확정',
+    description: 'AI 편차와 수동 점수 차이를 보고 교사가 최종 점수를 결정합니다.',
+    steps: ['우선 확인·확정 대기 필터로 검토 순서를 정합니다.', '회차별 AI와 항목별 근거를 확인합니다.', 'AI 제안·수동 점수·직접 결정 중 근거를 골라 최종 확정합니다.'],
+  },
+  analysis: {
+    title: '확정 점수와 분석 내보내기',
+    description: '확정 점수표, 문항별 신뢰도와 익명 개발 피드백 자료를 만듭니다.',
+    steps: ['회차와 수동 점수 포함 여부를 선택해 분석합니다.', '첫 시트가 확정 점수표인 Excel을 저장합니다.', '대회는 순위 조정안을 확정하고, 개발 피드백은 원본 제외 범위를 확인합니다.'],
+  },
+};
+
+function activeHelpTab() {
+  const active = document.querySelector('.tab-content.active');
+  return active?.id?.replace('tab-', '') || 'projects';
+}
+
+function openHelpModal(autoOpen = false) {
+  const help = HELP_BY_TAB[activeHelpTab()] || HELP_BY_TAB.projects;
+  document.getElementById('helpCurrentTitle').textContent = help.title;
+  document.getElementById('helpCurrentDescription').textContent = help.description;
+  document.getElementById('helpCurrentSteps').innerHTML = help.steps
+    .map(step => `<li>${esc(step)}</li>`)
+    .join('');
+  document.getElementById('helpDoNotAutoOpen').checked =
+    localStorage.getItem('aiGraderGuideSeen') === '1';
+  if (!autoOpen) document.getElementById('helpDiagnostics').style.display = 'none';
+  openModal('helpModal');
+}
+
+function closeHelpModal() {
+  if (document.getElementById('helpDoNotAutoOpen').checked) {
+    localStorage.setItem('aiGraderGuideSeen', '1');
   } else {
-    alert('Excel 생성 실패');
+    localStorage.removeItem('aiGraderGuideSeen');
+  }
+  closeModal('helpModal');
+}
+
+async function createSampleProjectFromHelp() {
+  if (!confirm('실제 학생 정보와 AI 호출이 없는 가상 샘플 프로젝트를 만들까요?')) return;
+  const button = document.getElementById('sampleProjectButton');
+  const status = document.getElementById('sampleProjectStatus');
+  button.disabled = true;
+  status.textContent = '가상 자료와 결과를 만드는 중입니다.';
+  try {
+    const response = await fetch('/api/sample-project', { method: 'POST' });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || '샘플을 만들지 못했습니다.');
+    status.className = 'inline-status success';
+    status.textContent = data.message;
+    await loadProjects();
+    await selectProject(data.project.id, true);
+    closeHelpModal();
+    showWorkspaceStage('overview');
+  } catch (error) {
+    status.className = 'inline-status danger';
+    status.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function runAppDiagnostics() {
+  const container = document.getElementById('helpDiagnostics');
+  container.style.display = 'block';
+  container.innerHTML = '<div class="review-loading">환경과 프로젝트 상태를 검사하는 중입니다.</div>';
+  const query = currentProject ? `?project_id=${encodeURIComponent(currentProject.id)}` : '';
+  try {
+    const response = await fetch(`/api/diagnostics${query}`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || '진단을 실행하지 못했습니다.');
+    const project = data.project;
+    const issues = data.issues || [];
+    const dependencyFailures = (data.dependencies || []).filter(item => item.required && !item.available);
+    container.innerHTML = `
+      <div class="diagnostic-summary">
+        <span>앱 <strong>${esc(data.app_version)}</strong></span>
+        <span>프로젝트 저장 <strong>${data.projects_writable ? '정상' : '확인 필요'}</strong></span>
+        <span>필수 구성요소 <strong>${dependencyFailures.length ? `${dependencyFailures.length}개 누락` : '정상'}</strong></span>
+        <span>OpenAI 키 <strong>${data.api_keys?.openai ? '설정됨' : '미설정'}</strong></span>
+        <span>Gemini 키 <strong>${data.api_keys?.google ? '설정됨' : '미설정'}</strong></span>
+        ${project ? `<span>전체 채점 <strong>${project.full_round_count}/2회</strong></span><span>최종 확정 <strong>${project.approved_count}/${project.participant_count}</strong></span>` : ''}
+      </div>
+      <div class="diagnostic-issues">${issues.length ? issues.map(issue => `
+        <div class="diagnostic-issue ${esc(issue.severity)}">
+          <strong>${esc(issue.message)}</strong>
+          <small>${esc(issue.action)}</small>
+        </div>`).join('') : '<div class="diagnostic-issue"><strong>치명적인 환경 문제가 발견되지 않았습니다.</strong></div>'}</div>`;
+  } catch (error) {
+    container.innerHTML = `<div class="criteria-error">${esc(error.message)}</div>`;
   }
 }
 
@@ -3619,4 +3818,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (input) input.addEventListener('change', scheduleGradingPlanEstimate);
   });
   setInterval(updateStats, 3000);
+  if (localStorage.getItem('aiGraderGuideSeen') !== '1') {
+    setTimeout(() => openHelpModal(true), 250);
+  }
 });

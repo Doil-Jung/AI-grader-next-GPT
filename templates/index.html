@@ -17,6 +17,7 @@
   <div class="header-actions">
     <button class="btn btn-secondary btn-sm" onclick="showTab('projects')">📁 프로젝트</button>
     <button class="btn btn-secondary btn-sm" id="projectSettingsButton" onclick="showTab('settings')" style="display:none">⚙️ 프로젝트 설정</button>
+    <button class="btn btn-secondary btn-sm" onclick="openHelpModal()">❓ 도움말</button>
     <button class="btn btn-secondary btn-sm" onclick="openKeyModal()">🔑 API 키</button>
   </div>
 </header>
@@ -719,21 +720,88 @@
     <div class="section-heading compact">
       <div>
         <span class="eyebrow">대회·탐구 심사 전용</span>
-        <h2>순위 조정과 제출용 채점표</h2>
+        <h2>순위 조정과 최종 점수 배정</h2>
+        <p>AI가 산출한 원 평가점수는 바꾸지 않습니다. 드래그한 순위와 공동순위에 따라 최종 점수를 별도로 배정하고 교사 확정 이력을 남깁니다.</p>
       </div>
     </div>
-    <p style="color:var(--text2);font-size:.85rem;margin-bottom:16px">
-      ① 팀을 불러온 후 드래그로 순위 배치 → ② 필요 시 점수 직접 입력 → ③ 미리보기로 확인 → ④ Excel 다운로드
-    </p>
-    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:16px">
-      <select id="subRound" onchange="loadSubmission()"></select>
-      <button class="btn btn-secondary btn-sm" onclick="loadSubmission()">결과 불러오기</button>
-      <button class="btn btn-secondary btn-sm" onclick="loadAllTeamsSubmission()">전체 팀 불러오기(수동)</button>
-      <button class="btn btn-primary btn-sm" onclick="previewSubmission()">📋 채점표 생성 (미리보기)</button>
-      <button class="btn btn-success btn-sm" id="btnExportExcel" onclick="exportSubmissionExcel()" disabled>📥 Excel 다운로드</button>
+    <div id="competitionSavedStatus" class="info-callout" style="margin:0 0 14px">저장된 순위 조정 이력을 확인하는 중입니다.</div>
+    <div class="competition-controls">
+      <div class="form-group">
+        <label>원 평가 회차</label>
+        <select id="subRound" onchange="loadSubmission()"></select>
+      </div>
+      <div class="form-group competition-score-table">
+        <label>허용 최종 점수 — 쉼표로 구분</label>
+        <input id="competitionAllowedScores" placeholder="예: 100, 98, 96, 94, 92">
+      </div>
+      <div class="form-group competition-note">
+        <label>이번 확정 메모</label>
+        <input id="competitionApprovalNote" placeholder="순위 조정 사유나 회의 결과를 선택적으로 기록">
+      </div>
     </div>
-    <div class="table-wrap"><table><thead><tr><th style="width:40px"></th><th>순위</th><th>번호</th><th>이름</th><th>총점</th><th>점수 조정</th></tr></thead><tbody id="submissionBody"></tbody></table></div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:16px">
+      <button class="btn btn-secondary btn-sm" onclick="loadSubmission()">원 평가 결과 불러오기</button>
+      <button class="btn btn-secondary btn-sm" onclick="loadSavedCompetitionRanking()">저장된 확정안 불러오기</button>
+      <button class="btn btn-primary btn-sm" onclick="previewSubmission()">자동 배정 미리보기</button>
+      <button class="btn btn-success btn-sm" id="btnApproveCompetition" onclick="approveCompetitionRanking()" disabled>교사 확정·이력 저장</button>
+      <button class="btn btn-secondary btn-sm" id="btnExportExcel" onclick="exportSubmissionExcel()" disabled>📥 확정 순위표 Excel</button>
+    </div>
+    <div class="info-callout" style="margin:0 0 12px">사용 순서: 원 평가 결과 불러오기 → 행을 드래그해 순서 변경 → 필요하면 ‘위와 공동순위’ 선택 → 자동 배정 미리보기 → 교사 확정. 자동 점수를 직접 바꾸려면 예외 사유가 필요합니다.</div>
+    <div class="table-wrap"><table><thead><tr><th style="width:40px"></th><th>표시 순위</th><th>공동</th><th>번호</th><th>이름</th><th>원 평가점수</th><th>예외 최종점수</th><th>예외 사유</th></tr></thead><tbody id="submissionBody"></tbody></table></div>
     <div id="submissionPreview" style="margin-top:24px"></div>
+    <div id="competitionHistory" style="margin-top:18px"></div>
+  </div>
+</div>
+
+<!-- 모달: 첫 실행·화면별 도움말 -->
+<div class="modal-overlay" id="helpModal">
+  <div class="modal help-modal">
+    <div class="modal-header">
+      <div>
+        <span class="eyebrow">AI 채점기 by GPT · {{ app_version }}</span>
+        <h2>교사용 도움말</h2>
+      </div>
+      <button class="btn-icon" onclick="closeHelpModal()">✕</button>
+    </div>
+
+    <section class="help-current-stage">
+      <span>현재 화면에서 할 일</span>
+      <h3 id="helpCurrentTitle">프로젝트 시작</h3>
+      <p id="helpCurrentDescription">평가 유형을 선택하고 새 프로젝트를 만듭니다.</p>
+      <ol id="helpCurrentSteps"></ol>
+    </section>
+
+    <h3>공통 6단계</h3>
+    <div class="help-step-grid">
+      <div><strong>1 개요</strong><span>현재 상태와 다음 작업</span></div>
+      <div><strong>2 평가기준</strong><span>기준 준비·교사 승인</span></div>
+      <div><strong>3 학생·답안</strong><span>명렬·분할·파일 연결</span></div>
+      <div><strong>4 AI 채점</strong><span>독립 회차·재시도</span></div>
+      <div><strong>5 검토·확정</strong><span>편차·수동 비교·승인</span></div>
+      <div><strong>6 내보내기</strong><span>확정표·분석·익명 자료</span></div>
+    </div>
+
+    <div class="help-action-grid">
+      <div class="help-action-card">
+        <h3>가상 자료로 먼저 연습</h3>
+        <p>실제 학생 정보와 API 요청 없이 5명·2회차·수동 점수·최종 확정이 들어 있는 샘플을 만듭니다.</p>
+        <button class="btn btn-primary btn-sm" id="sampleProjectButton" onclick="createSampleProjectFromHelp()">가상 샘플 프로젝트 만들기</button>
+        <span id="sampleProjectStatus" class="inline-status"></span>
+      </div>
+      <div class="help-action-card">
+        <h3>환경·프로젝트 진단</h3>
+        <p>저장 권한, 필수 구성요소, API 키 설정 여부와 현재 프로젝트의 준비 상태를 검사합니다.</p>
+        <button class="btn btn-secondary btn-sm" onclick="runAppDiagnostics()">진단 실행</button>
+      </div>
+    </div>
+    <div id="helpDiagnostics" class="help-diagnostics" style="display:none"></div>
+
+    <div class="help-manual-links">
+      <a class="btn btn-secondary btn-sm" href="/api/manual/quick-start" target="_blank">빠른 시작 설명서</a>
+      <a class="btn btn-secondary btn-sm" href="/api/manual/troubleshooting" target="_blank">오류 해결 안내</a>
+      <a class="btn btn-secondary btn-sm" href="/api/manual/release-checklist" target="_blank">배포 전 확인표</a>
+    </div>
+    <label class="help-dismiss"><input type="checkbox" id="helpDoNotAutoOpen"> 다음 실행부터 자동으로 열지 않기</label>
   </div>
 </div>
 

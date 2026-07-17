@@ -82,6 +82,14 @@ from services.feedback_export import (
     create_feedback_bundle,
     preview_feedback_export,
 )
+from services.competition import (
+    approve_competition_plan,
+    build_competition_plan,
+    build_competition_workbook,
+    competition_state_view,
+)
+from services.diagnostics import APP_VERSION, build_diagnostics
+from services.sample_project import create_sample_project
 
 
 app = Flask(__name__, template_folder=str(BUNDLE_DIR / "templates"), static_folder=str(BUNDLE_DIR / "static"))
@@ -366,7 +374,48 @@ def _apply_exam_data(config: ProjectConfig, exam_data: dict) -> None:
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", app_version=APP_VERSION)
+
+
+@app.route("/api/diagnostics")
+def api_diagnostics():
+    project_id = request.args.get("project_id", "").strip()
+    config = load_project(project_id) if project_id else None
+    if project_id and not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    return jsonify(build_diagnostics(
+        config=config,
+        api_keys=load_api_keys(),
+    ))
+
+
+@app.route("/api/sample-project", methods=["POST"])
+def api_sample_project():
+    try:
+        config = create_sample_project()
+    except (OSError, ValueError) as exc:
+        return jsonify({"error": f"샘플 프로젝트를 만들지 못했습니다: {exc}"}), 400
+    return jsonify({
+        "success": True,
+        "project": config.to_dict(),
+        "message": "실제 학생 정보와 AI 호출이 없는 가상 샘플을 만들었습니다.",
+    })
+
+
+@app.route("/api/manual/<manual_name>")
+def api_manual(manual_name):
+    manuals = {
+        "quick-start": "TEACHER_QUICK_START.md",
+        "troubleshooting": "TROUBLESHOOTING.md",
+        "release-checklist": "RELEASE_CHECKLIST.md",
+    }
+    filename = manuals.get(manual_name)
+    if not filename:
+        return jsonify({"error": "매뉴얼을 찾을 수 없습니다."}), 404
+    path = BUNDLE_DIR / "docs" / filename
+    if not path.exists():
+        return jsonify({"error": "매뉴얼 파일이 설치되어 있지 않습니다."}), 404
+    return send_file(path, mimetype="text/markdown; charset=utf-8")
 
 
 @app.route("/api/browse-folder", methods=["POST"])
@@ -3570,6 +3619,94 @@ def api_generate_rubric(project_id):
 # ═══════════════════════════════════════════════════════════
 # 제출용 채점표 (수동 순위 조정)
 # ═══════════════════════════════════════════════════════════
+
+
+@app.route("/api/projects/<project_id>/competition-ranking")
+def api_competition_ranking(project_id):
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    if config.workflow_type != "competition":
+        return jsonify({"error": "대회·탐구 심사 프로젝트가 아닙니다."}), 400
+    return jsonify(competition_state_view(config))
+
+
+@app.route(
+    "/api/projects/<project_id>/competition-ranking/preview",
+    methods=["POST"],
+)
+def api_competition_ranking_preview(project_id):
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    data = request.json or {}
+    try:
+        plan = build_competition_plan(
+            config,
+            source_round=int(data.get("source_round", 0)),
+            teams=data.get("teams") or [],
+            allowed_scores=data.get("allowed_scores"),
+        )
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(plan)
+
+
+@app.route(
+    "/api/projects/<project_id>/competition-ranking/approve",
+    methods=["POST"],
+)
+def api_competition_ranking_approve(project_id):
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    data = request.json or {}
+    try:
+        current = approve_competition_plan(
+            config,
+            source_round=int(data.get("source_round", 0)),
+            teams=data.get("teams") or [],
+            allowed_scores=data.get("allowed_scores"),
+            approval_note=data.get("approval_note", ""),
+        )
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"success": True, "current": current})
+
+
+@app.route("/api/projects/<project_id>/competition-ranking/excel")
+def api_competition_ranking_excel(project_id):
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    state = competition_state_view(config)
+    if state.get("current_stale"):
+        return jsonify({
+            "error": "확정 뒤 원 평가 회차 결과가 변경되었습니다. 다시 확인·확정하세요."
+        }), 409
+    try:
+        workbook = build_competition_workbook(
+            config,
+            state.get("current"),
+            state.get("history", []),
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = (
+        PROJECTS_DIR / project_id / "results"
+        / f"대회_최종순위표_{timestamp}.xlsx"
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(output_path)
+    return send_file(
+        output_path,
+        as_attachment=True,
+        download_name=output_path.name,
+        mimetype=(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+    )
 
 def _get_valid_totals(config):
     """루브릭 세부 항목 조합으로 실제 나올 수 있는 총점 집합 (DP)"""

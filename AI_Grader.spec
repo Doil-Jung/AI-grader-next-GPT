@@ -14,6 +14,7 @@ a = Analysis(
         ('static', 'static'),
         ('models', 'models'),
         ('services', 'services'),
+        ('docs', 'docs'),
         ('config.py', '.'),
     ] + playwright_datas,
     hiddenimports=[
