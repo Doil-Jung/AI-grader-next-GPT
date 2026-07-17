@@ -8,6 +8,9 @@ let currentSubmissionStatus = null;
 let submissionFilesByIndex = [];
 let currentCriteriaVersions = null;
 let pendingCriteriaSource = null;
+let currentGradingRounds = [];
+let currentRegradeCandidates = [];
+let gradingPlanTimer = null;
 
 const WORKFLOW_LABELS = {
   report: '보고서·수행평가',
@@ -44,6 +47,8 @@ function showTab(name) {
   if (name === 'grading') {
     renderGradingGrid();
     updateGradingRoundContext();
+    loadGradingRounds();
+    updateGradingPlanEstimate();
   }
 }
 
@@ -332,8 +337,9 @@ function renderOverview(data) {
   }
   roundContainer.innerHTML = rounds.map(round => `
     <div class="round-card">
-      <div class="round-title"><strong>${round.id}회차</strong><span class="badge badge-primary">${round.completed_count}명 완료</span></div>
-      <p>교사 확정 ${round.approved_count}명 · 검토 표시 ${round.review_required_count}명 · 승인 대기 ${round.pending_count}명</p>
+      <div class="round-title"><strong>${round.id}회차</strong><span class="round-status status-${esc(round.status || 'legacy')}">${roundStatusLabel(round.status)}</span></div>
+      <p>${round.completed_count}/${round.target_count || round.completed_count}명 성공 · 실패 ${round.failure_count || 0}명 · 교사 확정 ${round.approved_count}명 · 검토 표시 ${round.review_required_count}명</p>
+      <p class="round-context-line">${round.model ? `${esc(round.provider)} · ${esc(round.model)} · ${criteriaVersionLabel(round)}` : '기존 회차 · 모델·기준 기록 없음'}</p>
     </div>
   `).join('');
 }
@@ -1635,10 +1641,8 @@ function toggleAllMaterials(checked) {
 async function startSelectedGrading() {
   const selected = Array.from(document.querySelectorAll('.participant-check:checked')).map(el => parseInt(el.value));
   if (!selected.length) return alert('채점할 학생 또는 모둠을 선택하세요.');
-  if (confirm(`${selected.length}개 대상의 채점을 시작하시겠습니까?`)) {
-    showWorkspaceStage('grading');
-    startGrading(selected);
-  }
+  showWorkspaceStage('grading');
+  await startGrading(selected);
 }
 
 async function openFile(filePath) {
@@ -1703,6 +1707,188 @@ async function removeMaterial(filePath, fileName) {
 }
 
 // ═══ 채점 실행 ═══
+function roundStatusLabel(status) {
+  return ({
+    prepared: '준비됨',
+    running: '진행 중',
+    interrupted: '비정상 종료 · 이어하기 가능',
+    stopped: '중단됨',
+    partial: '일부 완료',
+    completed_with_errors: '실패 있음',
+    completed: '완료',
+    legacy: '기존 결과',
+  })[status] || status || '상태 확인';
+}
+
+function criteriaVersionLabel(round) {
+  if (round.criteria_version) {
+    return `기준 v${round.criteria_version}${round.criteria_version === round.approved_criteria_version ? ' 승인' : ''}`;
+  }
+  return round.criteria_status ? `기준 ${round.criteria_status}` : '기준 버전 미저장';
+}
+
+function gradingRequestPayload(teamNumbers = null, options = {}) {
+  const mode = options.mode || document.getElementById('gradingRunMode')?.value || 'new';
+  return {
+    start_from: Math.max(1, parseInt(options.start_from ?? document.getElementById('startFrom')?.value) || 1),
+    delay: Math.max(0, parseInt(document.getElementById('delay')?.value) || 0),
+    repeat_count: Math.max(1, parseInt(options.repeat_count ?? document.getElementById('repeatCount')?.value) || 1),
+    new_round: options.new_round ?? (mode === 'new'),
+    round_id: options.round_id || null,
+    retry_failed: Boolean(options.retry_failed),
+    team_numbers: teamNumbers,
+  };
+}
+
+function formatGradingEstimate(plan) {
+  const estimate = plan.estimate || {};
+  const minutes = estimate.estimated_minutes_range || [0, 0];
+  const cost = estimate.estimated_cost_range_krw;
+  const costText = cost
+    ? ` · 비용 약 ${cost[0].toLocaleString()}~${cost[1].toLocaleString()}원`
+    : ' · 비용은 무료/유료 티어와 실제 토큰 사용량에 따라 달라 별도 표시하지 않음';
+  const modeText = plan.mode === 'resume'
+    ? `${plan.round_id}회차 이어서`
+    : (plan.mode === 'retry_failed' ? `${plan.round_id}회차 실패 재시도` : `${plan.round_id}회차부터 새로`);
+  return `${modeText} · 대상 ${plan.target_count}명 · 독립 ${plan.repeat_count}회 · 예상 요청 ${estimate.expected_requests || 0}회 · 약 ${minutes[0]}~${minutes[1]}분${costText}`;
+}
+
+async function updateGradingPlanEstimate(teamNumbers = null, options = {}) {
+  if (!currentProject) return null;
+  const element = document.getElementById('gradingPlanEstimate');
+  if (element) element.textContent = '예상 요청 수와 시간을 계산하는 중입니다.';
+  try {
+    const res = await fetch(`/api/projects/${currentProject.id}/grading-plan`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(gradingRequestPayload(teamNumbers, options)),
+    });
+    const plan = await res.json();
+    if (!res.ok) throw new Error(plan.error || '실행 계획 계산 실패');
+    if (element) {
+      element.innerHTML = `<strong>${esc(formatGradingEstimate(plan))}</strong><span>${esc(plan.estimate?.estimate_note || '')}</span>`;
+      element.classList.toggle('has-error', Boolean(plan.context_error));
+      if (plan.context_error) element.innerHTML += `<span class="criteria-error">❌ ${esc(plan.context_error)}</span>`;
+    }
+    return plan;
+  } catch (error) {
+    if (element) element.textContent = `예상 계산 실패: ${error.message}`;
+    return null;
+  }
+}
+
+function scheduleGradingPlanEstimate() {
+  if (gradingPlanTimer) clearTimeout(gradingPlanTimer);
+  gradingPlanTimer = setTimeout(() => updateGradingPlanEstimate(), 250);
+}
+
+async function loadGradingRounds() {
+  if (!currentProject) return;
+  const element = document.getElementById('gradingRoundList');
+  if (!element) return;
+  const res = await fetch(`/api/projects/${currentProject.id}/rounds`);
+  const rounds = await res.json();
+  if (!res.ok) {
+    element.innerHTML = `<div class="criteria-error">${esc(rounds.error || '회차 기록을 불러오지 못했습니다.')}</div>`;
+    return;
+  }
+  currentGradingRounds = rounds;
+  if (!rounds.length) {
+    element.innerHTML = '<div class="empty-state"><p>아직 회차가 없습니다. 기본값은 전체 대상 독립 채점 2회입니다.</p></div>';
+    return;
+  }
+  element.innerHTML = [...rounds].reverse().map(round => {
+    const failureList = (round.failures || []).map(failure => `
+      <div class="round-failure-item">
+        <strong>${failure.team_number}번 ${esc(failure.team_name || '')}</strong>
+        <span>${esc(failure.message)}</span>
+        <span class="failure-action">${esc(failure.action || '')}</span>
+      </div>`).join('');
+    return `<div class="grading-round-card">
+      <div class="grading-round-header">
+        <div><strong>${round.id}회차</strong><span class="round-status status-${esc(round.status)}">${roundStatusLabel(round.status)}</span></div>
+        <div class="round-actions">
+          ${round.can_resume ? `<button class="btn btn-secondary btn-sm" onclick="resumeRound(${round.id})">성공 결과 보존하고 이어서</button>` : ''}
+          ${round.can_retry ? `<button class="btn btn-warning btn-sm" onclick="retryFailedRound(${round.id})">실패 ${round.failure_count}명 재시도</button>` : ''}
+        </div>
+      </div>
+      <div class="round-metrics">
+        <span>성공 ${round.completed_count}/${round.target_count}</span>
+        <span>실패 ${round.failure_count}</span>
+        <span>시도 ${round.attempt_count || 0}회</span>
+      </div>
+      <div class="round-context-line">${round.model ? `${esc(round.provider)} · ${esc(round.model)} · ${criteriaVersionLabel(round)}` : '기존 회차 · 모델과 기준 버전 기록 없음'}</div>
+      ${failureList ? `<details class="round-failures" open><summary>실패 원인과 복구 안내</summary>${failureList}</details>` : ''}
+    </div>`;
+  }).join('');
+}
+
+async function resumeRound(roundId) {
+  document.getElementById('gradingRunMode').value = 'resume';
+  document.getElementById('repeatCount').value = 1;
+  await startGrading(null, {
+    mode: 'resume',
+    new_round: false,
+    round_id: roundId,
+    repeat_count: 1,
+    start_from: 1,
+  });
+}
+
+async function retryFailedRound(roundId) {
+  document.getElementById('gradingRunMode').value = 'resume';
+  document.getElementById('repeatCount').value = 1;
+  await startGrading(null, {
+    mode: 'resume',
+    new_round: false,
+    round_id: roundId,
+    retry_failed: true,
+    repeat_count: 1,
+    start_from: 1,
+  });
+}
+
+async function loadRegradeCandidates() {
+  if (!currentProject) return;
+  const element = document.getElementById('regradeCandidateList');
+  const stdThreshold = parseFloat(document.getElementById('candidateStdThreshold').value) || 0;
+  const rangeThreshold = parseFloat(document.getElementById('candidateRangeThreshold').value) || 0;
+  element.innerHTML = '<div class="empty-state"><p>회차 차이를 분석하는 중입니다.</p></div>';
+  const res = await fetch(
+    `/api/projects/${currentProject.id}/regrade-candidates?std_threshold=${encodeURIComponent(stdThreshold)}&range_threshold=${encodeURIComponent(rangeThreshold)}`
+  );
+  const data = await res.json();
+  if (!res.ok) {
+    element.innerHTML = `<div class="criteria-error">${esc(data.error || '차이 대상 분석 실패')}</div>`;
+    return;
+  }
+  currentRegradeCandidates = data.candidates || [];
+  const button = document.getElementById('startCandidateRoundButton');
+  button.disabled = !currentRegradeCandidates.length;
+  if (!currentRegradeCandidates.length) {
+    element.innerHTML = `<div class="empty-state"><p>${esc(data.message || '현재 기준을 넘는 차이 대상이 없습니다.')}</p></div>`;
+    return;
+  }
+  element.innerHTML = `
+    <div class="candidate-summary">${data.rounds.join('·')}회차 비교 · ${data.evaluated_count}명 중 ${currentRegradeCandidates.length}명 제안</div>
+    ${currentRegradeCandidates.map(candidate => `
+      <label class="candidate-item">
+        <input type="checkbox" class="regrade-candidate-check" value="${candidate.team_number}" checked>
+        <span><strong>${candidate.team_number}번 ${esc(candidate.team_name || '')}</strong>
+        <small>점수 ${Object.values(candidate.scores).join(' / ')} · ${esc(candidate.reasons.join(' · '))}</small></span>
+      </label>`).join('')}`;
+}
+
+async function startCandidateRound() {
+  const selected = [...document.querySelectorAll('.regrade-candidate-check:checked')]
+    .map(input => parseInt(input.value))
+    .filter(Number.isFinite);
+  if (!selected.length) return alert('추가 채점할 학생을 선택하세요.');
+  document.getElementById('gradingRunMode').value = 'new';
+  document.getElementById('repeatCount').value = 1;
+  await startGrading(selected, { new_round: true, repeat_count: 1 });
+}
+
 async function updateGradingRoundContext(activeRound = null) {
   if (!currentProject) return;
   const element = document.getElementById('gradingRoundContext');
@@ -1720,11 +1906,14 @@ async function updateGradingRoundContext(activeRound = null) {
       return;
     }
     if (!rounds.length) {
-      element.textContent = '아직 채점 회차가 없습니다. 첫 실행은 1회차로 기록됩니다.';
+      element.textContent = '아직 채점 회차가 없습니다. 기본 실행은 같은 조건으로 독립 채점 2회입니다.';
       return;
     }
     const latest = rounds.at(-1);
-    element.textContent = `현재 ${rounds.length}개 회차 · 최근 ${latest.id}회차 ${latest.count}명 완료 · ‘새 회차’를 선택하면 ${latest.id + 1}회차로 기록됩니다.`;
+    const context = latest.model
+      ? `${latest.provider} · ${latest.model} · ${criteriaVersionLabel(latest)}`
+      : '기존 회차 · 실행 조건 기록 없음';
+    element.textContent = `현재 ${rounds.length}개 회차 · 최근 ${latest.id}회차 ${latest.completed_count}/${latest.target_count}명 성공 · ${roundStatusLabel(latest.status)} · ${context}`;
   } catch (error) {
     element.textContent = '회차 정보를 불러오지 못했습니다. 채점 결과는 기존 방식대로 보존됩니다.';
   }
@@ -1736,12 +1925,14 @@ async function renderGradingGrid() {
   if (!el) return;
   el.innerHTML = '<div style="font-size: 0.85rem; color: var(--text2);">참가자 목록을 불러오는 중...</div>';
   try {
-    const [matRes, statRes] = await Promise.all([
+    const [matRes, statRes, roundRes] = await Promise.all([
       fetch(`/api/projects/${currentProject.id}/materials`),
-      fetch('/api/status')
+      fetch('/api/status'),
+      fetch(`/api/projects/${currentProject.id}/rounds`),
     ]);
     const matData = await matRes.json();
     const statData = await statRes.json();
+    const rounds = roundRes.ok ? await roundRes.json() : [];
     
     if (!matData.participants?.length) {
       el.innerHTML = '<div style="font-size: 0.85rem; color: var(--text2);">학생·답안 자료가 없습니다.</div>';
@@ -1756,9 +1947,18 @@ async function renderGradingGrid() {
         if (Array.isArray(resData)) resData.forEach(r => completedTeams.add(r.team_number));
       }
     } catch(e) {}
+    const activeRoundId = (
+      statData.running && statData.project_id === currentProject.id
+        ? statData.current_round
+        : rounds.at(-1)?.id
+    );
+    const activeRound = rounds.find(round => round.id === activeRoundId);
+    const failedTeams = new Set(
+      (activeRound?.failures || []).map(failure => Number(failure.team_number))
+    );
     
     el.innerHTML = matData.participants.map(t => `
-      <div class="team-tile ${completedTeams.has(t.number) ? 'done' : ''}" id="tile-team-${t.number}">
+      <div class="team-tile ${failedTeams.has(t.number) ? 'error' : (completedTeams.has(t.number) ? 'done' : '')}" id="tile-team-${t.number}">
         <div class="team-num">${t.number}번</div>
         <div class="team-name">${esc(t.name)}</div>
       </div>
@@ -1769,7 +1969,7 @@ async function renderGradingGrid() {
   }
 }
 
-async function startGrading(team_numbers = null) {
+async function startGrading(teamNumbers = null, options = {}) {
   if (!currentProject) return alert('프로젝트를 먼저 선택하세요');
   // 사전 검증
   if (currentProject.project_type === 'exam') {
@@ -1786,24 +1986,61 @@ async function startGrading(team_numbers = null) {
   if (!materialData.participants?.length) {
     return alert('채점할 학생·답안 자료가 없습니다.\n\n학생·답안 단계에서 폴더를 지정하거나 파일을 추가하세요.');
   }
-  const body = {
-    start_from: parseInt(document.getElementById('startFrom').value),
-    delay: parseInt(document.getElementById('delay').value),
-    repeat_count: parseInt(document.getElementById('repeatCount').value),
-    new_round: document.getElementById('newRound').checked,
-    team_numbers: team_numbers,
-  };
+  const body = gradingRequestPayload(teamNumbers, options);
+  const planResponse = await fetch(`/api/projects/${currentProject.id}/grading-plan`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const plan = await planResponse.json();
+  if (!planResponse.ok) return alert(plan.error || '채점 실행 계획을 만들지 못했습니다.');
+  if (plan.context_error) {
+    alert(`${plan.context_error}\n\n실행 방식을 ‘새 독립 회차로 시작’으로 바꾼 뒤 다시 시도하세요.`);
+    return;
+  }
+  if (!plan.can_start) {
+    const message = plan.mode === 'resume'
+      ? '이 회차의 대상은 모두 성공했습니다. 새 독립 회차를 시작하세요.'
+      : (plan.mode === 'retry_failed'
+        ? '이 회차에 다시 시도할 실패 학생이 없습니다.'
+        : '선택한 채점 대상이 없습니다.');
+    alert(message);
+    await loadGradingRounds();
+    return;
+  }
+  const context = plan.execution_context || {};
+  const confirmMessage = [
+    formatGradingEstimate(plan),
+    `실행 조건: ${context.provider || '-'} · ${context.model || '-'} · 기준 v${context.criteria_version || '미저장'}`,
+    plan.mode === 'new'
+      ? '각 회차는 독립 결과로 저장되며 기존 결과를 덮어쓰지 않습니다.'
+      : '이미 성공한 학생은 건너뛰고 남은 대상만 실행합니다.',
+    '',
+    '채점을 시작하시겠습니까?',
+  ].join('\n');
+  if (!confirm(confirmMessage)) return;
+
   const res = await fetch(`/api/projects/${currentProject.id}/start`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   const data = await res.json();
   if (!res.ok) {
-    alert(data.error);
+    alert(data.error || '채점을 시작하지 못했습니다.');
+    if (data.requires_new_round) {
+      document.getElementById('gradingRunMode').value = 'new';
+      await updateGradingPlanEstimate(teamNumbers, { ...options, mode: 'new', new_round: true });
+    }
     return;
   }
   document.getElementById('btnStart').disabled = true;
   document.getElementById('btnStop').disabled = false;
   document.getElementById('gradingLog').innerHTML = '';
+  const recovery = document.getElementById('gradingRecoveryGuide');
+  if (recovery) {
+    recovery.style.display = 'none';
+    recovery.textContent = '';
+  }
   updateGradingRoundContext(data.round);
   renderGradingGrid();
+  loadGradingRounds();
   connectSSE();
 }
 
@@ -1837,18 +2074,30 @@ function connectSSE() {
         if (td) td.className = 'team-tile done';
         break;
       case 'team_error': 
-        msg = `❌ ${data.name} 실패: ${data.error}`; cls = 'error'; 
+        msg = `❌ ${data.name} 실패: ${data.error}${data.action ? ` · ${data.action}` : ''}`; cls = 'error';
         const te = document.getElementById('tile-team-' + data.team);
         if (te) te.className = 'team-tile error';
+        const recovery = document.getElementById('gradingRecoveryGuide');
+        if (recovery) {
+          recovery.style.display = 'block';
+          recovery.innerHTML = `<strong>${esc(data.name)} 복구 안내</strong><span>${esc(data.action || '오류 내용을 확인한 뒤 이 회차의 실패 학생만 다시 시도하세요.')}</span>`;
+        }
         break;
       case 'finished': msg = `🏁 채점 완료! 성공: ${data.success}, 실패: ${data.fail}`; cls = 'success';
         document.getElementById('btnStart').disabled = false; document.getElementById('btnStop').disabled = true;
         if (eventSource) { eventSource.close(); eventSource = null; }
         updateGradingRoundContext();
+        loadGradingRounds();
+        loadOverview();
+        updateGradingPlanEstimate();
         break;
       case 'stopped': msg = `⏹ ${data.message}`; cls = 'error';
         document.getElementById('btnStart').disabled = false; document.getElementById('btnStop').disabled = true;
         if (eventSource) { eventSource.close(); eventSource = null; }
+        updateGradingRoundContext();
+        loadGradingRounds();
+        loadOverview();
+        updateGradingPlanEstimate();
         break;
     }
     if (msg) log.innerHTML += `<div class="log-entry ${cls}"><span class="time">${time}</span>${esc(msg)}</div>`;
@@ -1915,7 +2164,10 @@ async function loadRounds(selectId, cb) {
   const res = await fetch(`/api/projects/${currentProject.id}/rounds`);
   const rounds = await res.json();
   const sel = document.getElementById(selectId);
-  sel.innerHTML = rounds.map(r => `<option value="${r.id}">${r.id}회차 (${r.count}팀)</option>`).join('');
+  sel.innerHTML = rounds.map(r => {
+    const context = r.model ? ` · ${r.model}` : '';
+    return `<option value="${r.id}">${r.id}회차 (${r.completed_count}/${r.target_count}명 · ${roundStatusLabel(r.status)}${esc(context)})</option>`;
+  }).join('');
   if (cb) cb();
 }
 
@@ -1987,11 +2239,10 @@ function renderResultsTable() {
 }
 
 async function regradeSingle(teamNum) {
-  if (!confirm(`${teamNum}번 학생을 현재 회차에서 다시 채점하시겠습니까?\n(기존 결과가 덮어씌워집니다)`)) return;
   showWorkspaceStage('grading');
-  const newRoundCheck = document.getElementById('newRound');
-  if (newRoundCheck) newRoundCheck.checked = false;
-  startGrading([teamNum]);
+  document.getElementById('gradingRunMode').value = 'new';
+  document.getElementById('repeatCount').value = 1;
+  await startGrading([teamNum], { mode: 'new', new_round: true, repeat_count: 1 });
 }
 
 let currentDetailData = null;
@@ -2529,5 +2780,9 @@ document.addEventListener('DOMContentLoaded', async () => {
       showTab('projects');
     }
   }
+  ['startFrom', 'delay', 'repeatCount', 'gradingRunMode'].forEach(id => {
+    const input = document.getElementById(id);
+    if (input) input.addEventListener('change', scheduleGradingPlanEstimate);
+  });
   setInterval(updateStats, 3000);
 });

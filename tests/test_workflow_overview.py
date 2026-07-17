@@ -124,8 +124,25 @@ def test_overview_recommends_the_next_incomplete_stage(tmp_path, monkeypatch):
         {"team_number": 2, "team_name": "나", "total_score": 5},
         2,
     )
+    first_round = client.get(f"/api/projects/{project_id}/overview").get_json()
+    assert first_round["grading"]["latest_completed_count"] == 2
+    assert first_round["grading"]["completed_full_round_count"] == 1
+    assert first_round["next_action"]["stage"] == "grading"
+
+    grading.save_result(
+        project_id,
+        2,
+        {"team_number": 1, "team_name": "가", "total_score": 4},
+        1,
+    )
+    grading.save_result(
+        project_id,
+        2,
+        {"team_number": 2, "team_name": "나", "total_score": 5},
+        2,
+    )
     finished = client.get(f"/api/projects/{project_id}/overview").get_json()
-    assert finished["grading"]["latest_completed_count"] == 2
+    assert finished["grading"]["completed_full_round_count"] == 2
     assert finished["next_action"]["stage"] == "analysis"
 
 

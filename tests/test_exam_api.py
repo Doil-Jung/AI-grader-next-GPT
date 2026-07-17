@@ -316,7 +316,7 @@ def test_rubric_generation_prefers_short_split_student_answers(tmp_path, monkeyp
 
 
 def test_new_round_defaults_to_round_one_then_advances_when_results_exist(tmp_path, monkeypatch):
-    configure_temp_projects(tmp_path, monkeypatch)
+    projects = configure_temp_projects(tmp_path, monkeypatch)
 
     class DummyThread:
         def __init__(self, *args, **kwargs):
@@ -334,11 +334,15 @@ def test_new_round_defaults_to_round_one_then_advances_when_results_exist(tmp_pa
         "number": "1", "question_text": "문제", "max_score": 5,
         "model_answer": "답", "scoring_elements": [{"description": "핵심", "points": 5}],
     }]}})
+    materials_dir = projects / project_id / "materials"
+    materials_dir.mkdir(exist_ok=True)
+    (materials_dir / "1. 학생.pdf").write_bytes(b"%PDF-test")
 
     app_module.grading_state["running"] = False
     first = client.post(f"/api/projects/{project_id}/start", json={"new_round": True})
     assert first.status_code == 200
     assert first.get_json()["round"] == 1
+    assert first.get_json()["plan"]["execution_context"]["model"] == "gpt-5.6-luna"
 
     app_module.grading_state["running"] = False
     grading.save_result(project_id, 1, {"team_number": 1, "total_score": 5}, 1)

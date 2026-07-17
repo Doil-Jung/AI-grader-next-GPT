@@ -21,6 +21,9 @@ AI_MODELS = {
     "gemini-3.5-flash": {
         "name": "Gemini 3.5 Flash",
         "description": "Gemini API 채점 기본 (1티어 1,000회/일)",
+        "estimated_seconds_per_request": 75,
+        # 무료·유료 티어와 입력 분량에 따라 달라 숫자 비용은 표시하지 않는다.
+        "estimated_cost_krw": None,
     },
 }
 
@@ -28,11 +31,22 @@ AI_MODELS = {
 OPENAI_AI_MODELS = {
     "gpt-5.6-luna": {
         "name": "GPT-5.6 luna - 권장",
-        "description": "정확한 채점·저비용 (학생당 약 20원)",
+        "description": "정확한 채점·저비용",
+        "estimated_seconds_per_request": 45,
+        # 파일 길이·출력량에 따른 차이를 반영한 거친 학생 1명/1회차 범위.
+        "estimated_cost_krw": {
+            "report": [20, 100],
+            "exam": [40, 200],
+        },
     },
     "gpt-5.6-terra": {
         "name": "GPT-5.6 terra",
-        "description": "상위 품질 (학생당 약 50원)",
+        "description": "상위 품질",
+        "estimated_seconds_per_request": 60,
+        "estimated_cost_krw": {
+            "report": [50, 200],
+            "exam": [100, 400],
+        },
     },
 }
 

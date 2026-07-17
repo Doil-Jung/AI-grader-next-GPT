@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from config import PROJECTS_DIR
+from config import PROJECTS_DIR  # 기존 테스트·확장 모듈의 경로 주입 호환성 유지
 from models.project import ProjectConfig
-from services.grading import load_completed
+from services.grading import load_completed, list_round_summaries
 from services.submissions import build_submission_status
 
 
@@ -15,25 +15,16 @@ WORKFLOW_LABELS = {
 }
 
 
-def _round_summaries(project_id: str) -> list[dict]:
-    results_dir = PROJECTS_DIR / project_id / "results"
-    if not results_dir.exists():
-        return []
-
-    summaries = []
-    for directory in sorted(results_dir.glob("round_*")):
-        if not directory.is_dir():
-            continue
-        try:
-            round_id = int(directory.name.split("_", 1)[1])
-        except (IndexError, ValueError):
-            continue
-
-        completed = load_completed(project_id, round_id)
+def _round_summaries(
+    config: ProjectConfig, participant_count: int
+) -> list[dict]:
+    summaries = list_round_summaries(
+        config, participant_count=participant_count
+    )
+    for summary in summaries:
+        completed = load_completed(config.id, summary["id"])
         values = list(completed.values())
-        summaries.append({
-            "id": round_id,
-            "completed_count": len(values),
+        summary.update({
             "approved_count": sum(
                 1 for item in values if item.get("teacher_status") == "approved"
             ),
@@ -81,7 +72,7 @@ def build_project_overview(config: ProjectConfig) -> dict:
         elif config.criteria_state.status == "unversioned":
             criteria_label += " · 기존 기준"
 
-    rounds = _round_summaries(config.id)
+    rounds = _round_summaries(config, participant_count)
     latest_round = rounds[-1] if rounds else None
     completed_count = latest_round["completed_count"] if latest_round else 0
     approved_count = latest_round["approved_count"] if latest_round else 0
@@ -91,9 +82,15 @@ def build_project_overview(config: ProjectConfig) -> dict:
     criteria_ready = criteria_count > 0
     submissions_ready = submission_status["all_ready"]
     grading_started = bool(rounds)
-    grading_complete = grading_started and (
-        not participant_count or completed_count >= participant_count
-    )
+    completed_full_rounds = [
+        item
+        for item in rounds
+        if participant_count
+        and item["completed_count"] >= participant_count
+        and item.get("failure_count", 0) == 0
+    ]
+    # AI 신뢰도 비교를 위해 전체 대상 독립 채점 2회를 기본 완료 조건으로 둔다.
+    grading_complete = len(completed_full_rounds) >= 2
     if config.project_type == "exam":
         review_complete = grading_complete and completed_count > 0 and approved_count >= completed_count
     else:
@@ -113,14 +110,28 @@ def build_project_overview(config: ProjectConfig) -> dict:
             "reason": "채점할 학생 또는 제출 자료를 연결하세요.",
         }
     elif not grading_complete:
+        if latest_round and latest_round.get("failure_count", 0):
+            reason = (
+                f"{latest_round['id']}회차에서 {latest_round['failure_count']}명이 실패했습니다. "
+                "성공 결과는 보존되어 있으니 실패 학생만 재시도하세요."
+            )
+        elif completed_full_rounds:
+            reason = (
+                f"전체 대상 독립 채점 {len(completed_full_rounds)}/2회 완료. "
+                "AI 점수 신뢰도 비교를 위해 다음 회차를 실행하세요."
+            )
+        elif grading_started:
+            target_count = latest_round.get("target_count", participant_count)
+            reason = (
+                f"최근 {latest_round['id']}회차에서 "
+                f"{completed_count}/{target_count}명 성공했습니다."
+            )
+        else:
+            reason = "준비가 끝났습니다. 기본 2회 독립 채점을 시작하세요."
         next_action = {
             "stage": "grading",
             "label": "AI 채점 진행하기",
-            "reason": (
-                f"최근 회차에서 {completed_count}/{participant_count}명 완료했습니다."
-                if grading_started
-                else "준비가 끝났습니다. 첫 채점 회차를 시작하세요."
-            ),
+            "reason": reason,
         }
     elif config.project_type == "exam" and not review_complete:
         next_action = {
@@ -186,11 +197,16 @@ def build_project_overview(config: ProjectConfig) -> dict:
             "started": grading_started,
             "complete": grading_complete,
             "round_count": len(rounds),
+            "completed_full_round_count": len(completed_full_rounds),
+            "recommended_full_round_count": 2,
             "latest_completed_count": completed_count,
             "label": (
-                f"{len(rounds)}회차 · 최근 {completed_count}명 완료"
+                (
+                    f"기본 독립 채점 {len(completed_full_rounds)}/2회 완료"
+                    f" · 최근 {completed_count}/{latest_round.get('target_count', participant_count)}명"
+                )
                 if rounds
-                else "아직 채점하지 않음"
+                else "아직 채점하지 않음 · 기본 2회 권장"
             ),
         },
         "review": {

@@ -44,7 +44,8 @@ from services.file_manager import find_materials, get_participant_files, save_up
 from services.grading import (
     grading_state, event_queues, broadcast_event,
     load_completed, save_result, get_latest_round_id,
-    grading_worker, get_round_dir,
+    grading_worker, get_round_dir, build_grading_plan,
+    begin_round_attempt, list_round_summaries, RoundContextMismatch,
 )
 from services.export import generate_excel
 from services.pdf_splitter import build_split_plan, split_integrated_pdf, SplitValidationError
@@ -2218,18 +2219,67 @@ def api_convert_hwp(project_id):
 
 @app.route("/api/projects/<project_id>/rounds")
 def api_rounds(project_id):
-    results_dir = PROJECTS_DIR / project_id / "results"
-    results_dir.mkdir(parents=True, exist_ok=True)
-    rounds = []
-    for d in sorted(results_dir.iterdir()):
-        if d.is_dir() and d.name.startswith("round_"):
-            try:
-                round_id = int(d.name.split("_")[1])
-                count = len(list(d.glob("team_*.json")))
-                rounds.append({"id": round_id, "count": count})
-            except ValueError:
-                pass
-    return jsonify(rounds)
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    participants = [
+        participant
+        for participant in find_materials(config)
+        if participant.get("files")
+    ]
+    active_round = (
+        grading_state.get("current_round")
+        if grading_state.get("running")
+        and grading_state.get("project_id") == project_id
+        else None
+    )
+    return jsonify(list_round_summaries(
+        config,
+        participant_count=len(participants),
+        active_round_id=active_round,
+    ))
+
+
+def _grading_plan_from_payload(config: ProjectConfig, data: dict) -> dict:
+    try:
+        start_from = max(1, int(data.get("start_from", 1) or 1))
+        delay = max(0, min(300, int(data.get("delay", 5) or 0)))
+        repeat_count = max(1, min(10, int(data.get("repeat_count", 1) or 1)))
+        round_id = (
+            max(1, int(data["round_id"]))
+            if data.get("round_id") not in (None, "")
+            else None
+        )
+        team_numbers = [
+            int(number)
+            for number in (data.get("team_numbers") or [])
+            if int(number) > 0
+        ] or None
+    except (TypeError, ValueError):
+        raise ValueError("시작 번호·회차·반복 횟수·학생 번호를 확인하세요.")
+    return build_grading_plan(
+        config,
+        start_from=start_from,
+        delay=delay,
+        repeat_count=repeat_count,
+        new_round=bool(data.get("new_round", True)),
+        team_numbers=team_numbers,
+        round_id=round_id,
+        retry_failed=bool(data.get("retry_failed", False)),
+    )
+
+
+@app.route("/api/projects/<project_id>/grading-plan", methods=["POST"])
+def api_grading_plan(project_id):
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    try:
+        return jsonify(_grading_plan_from_payload(
+            config, request.get_json(silent=True) or {}
+        ))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
 
 @app.route("/api/projects/<project_id>/start", methods=["POST"])
@@ -2254,12 +2304,27 @@ def api_start_grading(project_id):
     elif not config.all_criteria:
         return jsonify({"error": "채점 기준(Rubric)이 설정되지 않았습니다. 설정 탭에서 채점 기준을 추가하세요."}), 400
     
-    data = request.json or {}
-    start_from = data.get("start_from", 1)
-    delay = data.get("delay", 5)
-    repeat_count = data.get("repeat_count", 1)
-    new_round = data.get("new_round", False)
-    team_numbers = data.get("team_numbers") # 특정 팀 번호 리스트 (개별/선택 채점용)
+    data = request.get_json(silent=True) or {}
+    try:
+        plan = _grading_plan_from_payload(config, data)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if plan["context_error"]:
+        return jsonify({
+            "error": plan["context_error"],
+            "plan": plan,
+            "requires_new_round": True,
+        }), 409
+    if not plan["can_start"]:
+        if not plan["available_count"]:
+            message = "채점할 학생·답안 파일이 없습니다. 학생·답안 단계에서 파일 연결을 확인하세요."
+        elif plan["mode"] == "retry_failed":
+            message = "이 회차에 다시 시도할 실패 학생이 없습니다."
+        elif plan["mode"] == "resume":
+            message = "이 회차의 채점 대상은 모두 성공했습니다. 새 독립 회차로 시작하세요."
+        else:
+            message = "선택한 채점 대상이 없습니다."
+        return jsonify({"error": message, "plan": plan}), 409
     
     # 제공자별 사전 조건 확인
     keys = load_api_keys()
@@ -2268,18 +2333,21 @@ def api_start_grading(project_id):
     if config.ai_provider == "openai_api" and not keys.get("openai", ""):
         return jsonify({"error": "OpenAI API 키가 설정되지 않았습니다. 우측 상단 'API 키' 버튼에서 설정하세요."}), 400
     
-    # 라운드 설정
-    latest_round = get_latest_round_id(project_id)
-    latest_has_results = any(get_round_dir(project_id, latest_round).glob("team_*.json"))
-    current_round = latest_round + 1 if new_round and latest_has_results else latest_round
-    get_round_dir(project_id, current_round).mkdir(parents=True, exist_ok=True)
+    current_round = int(plan["round_id"])
+    try:
+        begin_round_attempt(config, plan)
+    except RoundContextMismatch as exc:
+        return jsonify({
+            "error": str(exc),
+            "requires_new_round": True,
+        }), 409
     
     grading_state["running"] = True
     grading_state["should_stop"] = False
     grading_state["project_id"] = project_id
     grading_state["current_round"] = current_round
     grading_state["completed_count"] = 0
-    grading_state["total_count"] = 0
+    grading_state["total_count"] = plan["target_count"]
     grading_state["success_count"] = 0
     grading_state["fail_count"] = 0
     grading_state["current_team"] = None
@@ -2287,15 +2355,28 @@ def api_start_grading(project_id):
     grading_state["started_at"] = time.time()
     grading_state["team_started_at"] = None
     grading_state["stop_requested_at"] = None
+    grading_state["target_team_numbers"] = plan["target_team_numbers"]
+    grading_state["run_mode"] = plan["mode"]
+    grading_state["execution_context"] = plan["execution_context"]
     
     thread = threading.Thread(
         target=grading_worker,
-        args=(project_id, keys, start_from, delay, repeat_count, team_numbers),
+        args=(
+            project_id,
+            keys,
+            plan["delay"],
+            plan["repeat_count"],
+            plan,
+        ),
         daemon=True,
     )
     thread.start()
     
-    return jsonify({"message": "채점을 시작합니다.", "round": current_round})
+    return jsonify({
+        "message": "채점을 시작합니다.",
+        "round": current_round,
+        "plan": plan,
+    })
 
 
 @app.route("/api/stop", methods=["POST"])
@@ -2311,6 +2392,94 @@ def api_stop():
 @app.route("/api/status")
 def api_status():
     return jsonify(grading_state)
+
+
+@app.route("/api/projects/<project_id>/regrade-candidates")
+def api_regrade_candidates(project_id):
+    """두 회차 이상에서 점수 차이·검토 표시가 있는 학생을 추가 회차 후보로 제안."""
+    import statistics
+
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    round_ids = [
+        int(value)
+        for value in request.args.get("rounds", "").split(",")
+        if value.strip().isdigit()
+    ]
+    if not round_ids:
+        round_ids = [
+            item["id"]
+            for item in list_round_summaries(config)
+            if item["completed_count"] > 0
+        ][-2:]
+    if len(round_ids) < 2:
+        return jsonify({
+            "rounds": round_ids,
+            "candidates": [],
+            "message": "차이 대상을 찾으려면 결과가 있는 회차가 2개 이상 필요합니다.",
+        })
+    try:
+        std_threshold = max(
+            0.0, float(request.args.get("std_threshold", 1.5))
+        )
+        range_threshold = max(
+            0.0, float(request.args.get("range_threshold", 2.0))
+        )
+    except ValueError:
+        return jsonify({"error": "편차 기준은 0 이상의 숫자로 입력하세요."}), 400
+
+    by_team = {}
+    for round_id in round_ids:
+        for team_number, result in load_completed(project_id, round_id).items():
+            item = by_team.setdefault(team_number, {
+                "team_number": team_number,
+                "team_name": result.get("team_name", ""),
+                "scores": {},
+                "review_required": False,
+            })
+            item["scores"][round_id] = float(result.get("total_score", 0) or 0)
+            item["review_required"] = item["review_required"] or bool(
+                result.get("review_required_count", 0)
+                or any(
+                    key.endswith("_review_required") and value is True
+                    for key, value in result.items()
+                )
+            )
+
+    candidates = []
+    for item in by_team.values():
+        scores = list(item["scores"].values())
+        if len(scores) < 2:
+            continue
+        standard_deviation = statistics.pstdev(scores)
+        score_range = max(scores) - min(scores)
+        reasons = []
+        if standard_deviation >= std_threshold:
+            reasons.append(f"표준편차 {standard_deviation:.2f}점")
+        if score_range >= range_threshold:
+            reasons.append(f"최대 차이 {score_range:.2f}점")
+        if item["review_required"]:
+            reasons.append("AI 검토 필요 표시")
+        if reasons:
+            candidates.append({
+                **item,
+                "standard_deviation": round(standard_deviation, 2),
+                "score_range": round(score_range, 2),
+                "reasons": reasons,
+            })
+    candidates.sort(key=lambda item: (
+        -item["score_range"],
+        -item["standard_deviation"],
+        item["team_number"],
+    ))
+    return jsonify({
+        "rounds": round_ids,
+        "std_threshold": std_threshold,
+        "range_threshold": range_threshold,
+        "evaluated_count": len(by_team),
+        "candidates": candidates,
+    })
 
 
 @app.route("/api/events")

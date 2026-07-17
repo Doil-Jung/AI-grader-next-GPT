@@ -409,16 +409,57 @@
     <div class="form-row" style="margin-bottom:16px">
       <div class="form-group"><label>시작 번호</label><input id="startFrom" type="number" value="1" min="1"></div>
       <div class="form-group"><label>대기(초)</label><input id="delay" type="number" value="5" min="1"></div>
-      <div class="form-group"><label>이번 실행 반복 횟수</label><input id="repeatCount" type="number" value="1" min="1"></div>
+      <div class="form-group"><label>독립 채점 회차 수</label><input id="repeatCount" type="number" value="2" min="1" max="10"></div>
+      <div class="form-group">
+        <label>실행 방식</label>
+        <select id="gradingRunMode">
+          <option value="new">새 독립 회차로 시작</option>
+          <option value="resume">최근 회차 이어서 — 성공 결과 보존</option>
+        </select>
+      </div>
     </div>
-    <div style="display:flex;gap:8px;margin-bottom:16px">
+    <div id="gradingPlanEstimate" class="grading-plan-estimate">예상 요청 수와 시간을 계산하는 중입니다.</div>
+    <div style="display:flex;gap:8px;margin:12px 0 16px;flex-wrap:wrap">
       <button class="btn btn-success" id="btnStart" onclick="startGrading()">▶️ 채점 시작</button>
       <button class="btn btn-danger" id="btnStop" onclick="stopGrading()" disabled>⏹ 중단</button>
-      <label style="display:flex;align-items:center;gap:6px;font-size:.85rem"><input type="checkbox" id="newRound" checked> 새 회차 (권장)</label>
       <span id="gradingCurrentStatus" style="font-size:.82rem;color:var(--text2);align-self:center"></span>
     </div>
+    <div id="gradingRecoveryGuide" class="grading-recovery-guide" style="display:none"></div>
     <div class="log-box" id="gradingLog" style="margin-bottom:16px"></div>
     <div class="team-grid" id="gradingTeamGrid"></div>
+  </div>
+
+  <div class="card">
+    <div class="section-heading compact">
+      <div>
+        <span class="eyebrow">모델·기준·성공 결과 보존</span>
+        <h2>회차 기록과 복구</h2>
+        <p>각 회차에 사용한 공급자, 모델, 평가기준 버전을 고정 기록합니다. 실패 학생만 다시 실행해도 성공 결과는 덮어쓰지 않습니다.</p>
+      </div>
+      <button class="btn btn-secondary btn-sm" onclick="loadGradingRounds()">새로고침</button>
+    </div>
+    <div id="gradingRoundList" class="grading-round-list"></div>
+  </div>
+
+  <div class="card">
+    <div class="section-heading compact">
+      <div>
+        <span class="eyebrow">기본 2회 이후</span>
+        <h2>점수 차이 대상 추가 회차</h2>
+        <p>두 회차의 총점 차이와 AI 검토 표시를 이용해 추가 채점이 필요한 학생만 제안합니다.</p>
+      </div>
+    </div>
+    <div class="form-row" style="max-width:520px">
+      <div class="form-group"><label>표준편차 기준</label><input id="candidateStdThreshold" type="number" min="0" step="0.1" value="1.5"></div>
+      <div class="form-group"><label>최대 점수 차이 기준</label><input id="candidateRangeThreshold" type="number" min="0" step="0.5" value="2"></div>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+      <button class="btn btn-primary btn-sm" onclick="loadRegradeCandidates()">차이 대상 찾기</button>
+      <button class="btn btn-success btn-sm" id="startCandidateRoundButton" onclick="startCandidateRound()" disabled>선택 학생 추가 회차 채점</button>
+    </div>
+    <div id="regradeCandidateList" class="regrade-candidate-list">
+      <div class="empty-state"><p>기본 2회 채점 후 차이 대상을 확인할 수 있습니다.</p></div>
+    </div>
   </div>
 </div>
 
