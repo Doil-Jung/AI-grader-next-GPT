@@ -298,3 +298,52 @@ tr.clickable{cursor:pointer}
   .review-stats{grid-template-columns:repeat(2,1fr)}
   .review-controls,.review-decision-form{grid-template-columns:1fr}
 }
+
+/* 선채점 후 기준화 */
+.standardization-card .field-label{display:block;margin-bottom:7px;color:var(--text2);font-size:.82rem;font-weight:700}
+.standardization-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.standardization-rounds{display:grid;gap:7px;max-height:210px;padding-right:4px;overflow-y:auto}
+.standardization-round-option{display:flex;gap:9px;align-items:flex-start;padding:10px 12px;border:1px solid var(--border);border-radius:9px;background:var(--surface2);cursor:pointer}
+.standardization-round-option:has(input:checked){border-color:var(--primary);box-shadow:0 0 0 2px rgba(59,130,246,.08)}
+.standardization-round-option input{width:auto;margin-top:3px}
+.standardization-round-option span{display:grid;gap:2px}
+.standardization-round-option strong{font-size:.86rem}
+.standardization-round-option small{color:var(--text2);font-size:.74rem}
+.standardization-session-bar{display:grid;grid-template-columns:minmax(220px,1.2fr) minmax(180px,.7fr) minmax(220px,1fr);gap:12px;margin:15px 0 8px;padding:13px;border-radius:10px;background:var(--surface2)}
+.standardization-session-bar .form-group{margin:0}
+.standardization-draft{display:grid;gap:12px;margin-top:12px}
+.standardization-overall{margin:0}
+.standardization-overall p{margin:5px 0 0;white-space:pre-wrap}
+.standardization-draft-item{padding:15px;border:1px solid var(--border);border-radius:11px;background:var(--surface2)}
+.standardization-item-heading{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;margin-bottom:8px}
+.standardization-item-heading>div{display:grid;gap:3px}
+.standardization-item-heading small{color:var(--text2);font-size:.76rem}
+.standardization-evidence{flex:0 0 auto;padding:4px 8px;border-radius:999px;font-size:.72rem;font-weight:700}
+.evidence-strong{color:#047857;background:rgba(16,185,129,.13)}
+.evidence-moderate{color:#b45309;background:rgba(245,158,11,.13)}
+.evidence-weak{color:#b91c1c;background:rgba(239,68,68,.11)}
+.standardization-change{margin:6px 0 12px;padding:8px 10px;border-left:3px solid var(--primary);background:rgba(59,130,246,.07);color:var(--text2);font-size:.8rem}
+.standardization-draft-item details{margin-top:8px;color:var(--text2);font-size:.8rem}
+.standardization-draft-item details p{white-space:pre-wrap}
+.standardization-draft-actions{position:sticky;bottom:8px;z-index:5;margin-top:12px;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--surface);box-shadow:0 7px 24px rgba(15,23,42,.08)}
+.standardization-sample{margin-top:18px;padding-top:16px;border-top:1px solid var(--border)}
+.standardization-sample-action{display:flex;justify-content:flex-end;align-items:flex-end}
+.standardization-comparison{margin-top:10px}
+.standardization-comparison-head{display:flex;justify-content:space-between;gap:12px;padding:12px 14px;border-radius:10px 10px 0 0;background:var(--surface2)}
+.standardization-comparison-head>div{display:grid;gap:3px}
+.standardization-comparison-head span,.standardization-comparison-head small{color:var(--text2);font-size:.75rem}
+.standardization-comparison-head.verdict-improved{border-left:4px solid var(--success)}
+.standardization-comparison-head.verdict-worse{border-left:4px solid var(--danger)}
+.standardization-comparison-head.verdict-mixed,.standardization-comparison-head.verdict-insufficient{border-left:4px solid var(--warning)}
+.standardization-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1px;background:var(--border)}
+.standardization-metrics>div{display:grid;gap:4px;padding:11px 13px;background:var(--surface)}
+.standardization-metrics span{color:var(--text2);font-size:.73rem}
+.standardization-metrics strong{font-size:.86rem}
+.standardization-verdict-reasons{padding:9px 13px;border:1px solid var(--border);border-top:0}
+.standardization-verdict-reasons p{margin:3px 0;color:var(--text2);font-size:.78rem}
+.standardization-item-comparison{display:grid;gap:6px;margin-top:8px}
+.standardization-item-comparison>div{display:grid;grid-template-columns:minmax(100px,.7fr) repeat(2,minmax(150px,1fr));gap:8px;padding:8px 10px;border-radius:7px;background:var(--surface2);font-size:.77rem}
+@media(max-width:900px){
+  .standardization-grid,.standardization-session-bar,.standardization-metrics{grid-template-columns:1fr}
+  .standardization-item-comparison>div{grid-template-columns:1fr}
+}

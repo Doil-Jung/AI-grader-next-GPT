@@ -183,6 +183,71 @@
     <textarea id="cfgPrompt" rows="10" style="width:100%;font-size:.85rem"></textarea>
   </div>
 
+  <div class="card standardization-card" id="reportStandardizationCard">
+    <div class="section-heading compact">
+      <div>
+        <span class="eyebrow">선채점 후 기준화</span>
+        <h2>실제 결과로 루브릭 다듬기</h2>
+        <p>같은 기준의 여러 회차를 묶어 반복된 강점·오류와 경계 사례를 찾습니다. AI 초안은 별도로 보관되며 교사가 승인하기 전에는 실제 채점 기준이 바뀌지 않습니다.</p>
+      </div>
+      <span id="reportStandardizationState" class="criteria-state-badge">회차 확인 중</span>
+    </div>
+    <div class="standardization-grid">
+      <div>
+        <label class="field-label">분석할 선채점 회차</label>
+        <div id="reportStandardizationRounds" class="standardization-rounds"></div>
+      </div>
+      <div>
+        <label class="field-label" for="reportStandardizationInstruction">교사 추가 지시 (선택)</label>
+        <textarea id="reportStandardizationInstruction" rows="4" placeholder="예: 이론 설명보다 실제 자료 분석의 타당성을 더 중요하게 보고, 드문 표현은 자동 인정하지 말 것"></textarea>
+      </div>
+    </div>
+    <div class="criteria-actions">
+      <button class="btn btn-primary" id="reportStandardizationGenerate" onclick="generateStandardization()">선택 회차로 기준화 초안 생성</button>
+      <span id="reportStandardizationStatus" class="inline-status"></span>
+    </div>
+    <div class="standardization-session-bar">
+      <div class="form-group">
+        <label>저장된 기준화 작업</label>
+        <select id="reportStandardizationSession" onchange="selectStandardizationSession(this.value)"></select>
+      </div>
+      <div class="form-group">
+        <label>승인 후 AI 전달 방식</label>
+        <select id="reportStandardizationDelivery">
+          <option value="core">핵심 기준 우선 (권장)</option>
+          <option value="strict">교사용 상세 기준 전체</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>승인 메모 (선택)</label>
+        <input id="reportStandardizationTeacherNote" placeholder="예: 1·2회차 결과와 수동 점수 확인">
+      </div>
+    </div>
+    <div id="reportStandardizationValidation" class="criteria-validation"></div>
+    <div id="reportStandardizationDraft" class="standardization-draft">
+      <div class="empty-state"><p>선채점 회차를 선택해 기준화 초안을 만드세요.</p></div>
+    </div>
+    <div class="criteria-actions standardization-draft-actions">
+      <button class="btn btn-secondary btn-sm" id="reportStandardizationSave" onclick="saveStandardizationDraft()" disabled>수정한 초안 저장</button>
+      <button class="btn btn-success btn-sm" id="reportStandardizationApprove" onclick="approveStandardization()" disabled>교사 승인 및 새 기준 버전 적용</button>
+      <button class="btn btn-secondary btn-sm" id="reportStandardizationDiscard" onclick="discardStandardization()" disabled>초안 폐기</button>
+    </div>
+    <div id="reportStandardizationSample" class="standardization-sample" style="display:none">
+      <div class="section-heading compact">
+        <div>
+          <span class="eyebrow">전체 재채점 전 확인</span>
+          <h3>추천 표본 재채점</h3>
+          <p>낮음·중간·높은 점수대와 회차 차이·수동 점수 차이가 큰 대상을 우선 추천합니다. 실행 결과는 새 독립 회차로 보존됩니다.</p>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label>표본 학생 번호 (쉼표 구분)</label><input id="reportStandardizationSampleTeams" placeholder="예: 1, 7, 13"></div>
+        <div class="form-group standardization-sample-action"><button class="btn btn-primary" onclick="startStandardizationSample()">표본 재채점 시작</button></div>
+      </div>
+      <div id="reportStandardizationComparison" class="standardization-comparison"></div>
+    </div>
+  </div>
+
   <div style="display:flex;gap:8px;justify-content:flex-end">
     <button class="btn btn-primary" onclick="saveSettings()">💾 설정 저장</button>
   </div>
@@ -280,15 +345,69 @@
     <div style="text-align:right;margin-top:12px"><button class="btn btn-primary" onclick="saveSettings()">💾 문항 저장</button></div>
   </div>
 
-  <div class="card" id="rubricSynthesisCard">
-    <h2>📊 채점 결과 종합 → 기준안 만들기</h2>
-    <p style="font-size:.85rem;color:var(--text2);line-height:1.6">채점 기준을 먼저 정하지 않고 문제·정답만으로 전체 채점을 끝낸 뒤, 실제 채점 결과(문항별 점수·답안 요약·근거)를 종합해 채점 기준안, 예시답안, 정답 인정 답안, 감점 사례 초안을 만듭니다. 검토 후 문항 설정에 반영하고 저장하면, 그 기준으로 새 회차 재채점을 할 수 있습니다.</p>
-    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <button class="btn btn-primary" onclick="synthesizeRubricFromResults()">채점 결과 종합하기</button>
-      <button class="btn btn-success" id="applySynthesisBtn" style="display:none" onclick="applyRubricSynthesis()">문항 설정에 반영</button>
-      <span id="rubricSynthesisStatus" style="font-size:.85rem;color:var(--text2)"></span>
+  <div class="card standardization-card" id="examStandardizationCard">
+    <div class="section-heading compact">
+      <div>
+        <span class="eyebrow">선채점 후 기준화</span>
+        <h2>실제 답안으로 채점기준 다듬기</h2>
+        <p>같은 기준의 여러 회차를 분석해 대안 풀이, 반복 오류, 부분점 경계와 AI용 핵심 기준을 제안합니다. 초안은 교사가 승인할 때까지 본채점에 적용되지 않습니다.</p>
+      </div>
+      <span id="examStandardizationState" class="criteria-state-badge">회차 확인 중</span>
     </div>
-    <div id="rubricSynthesisPreview" style="margin-top:12px"></div>
+    <div class="standardization-grid">
+      <div>
+        <label class="field-label">분석할 선채점 회차</label>
+        <div id="examStandardizationRounds" class="standardization-rounds"></div>
+      </div>
+      <div>
+        <label class="field-label" for="examStandardizationInstruction">교사 추가 지시 (선택)</label>
+        <textarea id="examStandardizationInstruction" rows="4" placeholder="예: 동치인 식은 인정하되 단위 누락은 1점 감점, 한 명에게만 나온 특이 풀이는 경계 사례로 남길 것"></textarea>
+      </div>
+    </div>
+    <div class="criteria-actions">
+      <button class="btn btn-primary" id="examStandardizationGenerate" onclick="generateStandardization()">선택 회차로 기준화 초안 생성</button>
+      <span id="examStandardizationStatus" class="inline-status"></span>
+    </div>
+    <div class="standardization-session-bar">
+      <div class="form-group">
+        <label>저장된 기준화 작업</label>
+        <select id="examStandardizationSession" onchange="selectStandardizationSession(this.value)"></select>
+      </div>
+      <div class="form-group">
+        <label>승인 후 AI 전달 방식</label>
+        <select id="examStandardizationDelivery">
+          <option value="core">핵심 기준 채점 (권장)</option>
+          <option value="strict">공식 기준 엄격 적용</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>승인 메모 (선택)</label>
+        <input id="examStandardizationTeacherNote" placeholder="예: 1·2회차 결과와 경계 답안 확인">
+      </div>
+    </div>
+    <div id="examStandardizationValidation" class="criteria-validation"></div>
+    <div id="examStandardizationDraft" class="standardization-draft">
+      <div class="empty-state"><p>자율 선채점 회차를 선택해 기준화 초안을 만드세요.</p></div>
+    </div>
+    <div class="criteria-actions standardization-draft-actions">
+      <button class="btn btn-secondary btn-sm" id="examStandardizationSave" onclick="saveStandardizationDraft()" disabled>수정한 초안 저장</button>
+      <button class="btn btn-success btn-sm" id="examStandardizationApprove" onclick="approveStandardization()" disabled>교사 승인 및 새 기준 버전 적용</button>
+      <button class="btn btn-secondary btn-sm" id="examStandardizationDiscard" onclick="discardStandardization()" disabled>초안 폐기</button>
+    </div>
+    <div id="examStandardizationSample" class="standardization-sample" style="display:none">
+      <div class="section-heading compact">
+        <div>
+          <span class="eyebrow">전체 재채점 전 확인</span>
+          <h3>추천 표본 재채점</h3>
+          <p>점수대 대표와 회차 차이·수동 점수 차이·AI 확인 필요 대상을 새 승인 기준으로 재채점합니다. 결과는 새 독립 회차로 보존됩니다.</p>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label>표본 학생 번호 (쉼표 구분)</label><input id="examStandardizationSampleTeams" placeholder="예: 1, 7, 13"></div>
+        <div class="form-group standardization-sample-action"><button class="btn btn-primary" onclick="startStandardizationSample()">표본 재채점 시작</button></div>
+      </div>
+      <div id="examStandardizationComparison" class="standardization-comparison"></div>
+    </div>
   </div>
 
 </div>

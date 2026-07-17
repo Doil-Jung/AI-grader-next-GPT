@@ -56,6 +56,21 @@ from services.review import (
     approve_final_score, build_review_dashboard, import_manual_totals,
     load_manual_scores, reopen_final_score, set_manual_score,
 )
+from services.standardization import (
+    apply_draft_to_config as apply_standardization_draft,
+    build_generation_prompt as build_standardization_prompt,
+    build_workspace as build_standardization_workspace,
+    collect_evidence as collect_standardization_evidence,
+    create_session as create_standardization_session,
+    criteria_fingerprint as standardization_criteria_fingerprint,
+    discard_session as discard_standardization_session,
+    generation_schema as standardization_schema,
+    get_session as get_standardization_session,
+    mark_approved as mark_standardization_approved,
+    session_summary as standardization_session_summary,
+    update_draft as update_standardization_draft,
+    validate_draft as validate_standardization_draft,
+)
 from services.submissions import build_submission_status
 
 
@@ -856,6 +871,253 @@ def api_restore_criteria_version(project_id, version):
         "project": config.to_dict(),
         "validation": _criteria_validation(config),
     })
+
+
+def _standardization_detail(config: ProjectConfig, session: dict) -> dict:
+    workspace = build_standardization_workspace(config)
+    summary = next(
+        (
+            item for item in workspace["sessions"]
+            if item["id"] == session.get("id")
+        ),
+        standardization_session_summary(session),
+    )
+    return {
+        "session": session,
+        "summary": summary,
+        "criteria_state": vars(config.criteria_state),
+    }
+
+
+@app.route("/api/projects/<project_id>/standardizations", methods=["GET"])
+def api_standardizations(project_id):
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    return jsonify(build_standardization_workspace(config))
+
+
+@app.route("/api/projects/<project_id>/standardizations", methods=["POST"])
+def api_create_standardization(project_id):
+    """여러 선채점 회차를 분석하되 실제 평가기준은 변경하지 않고 초안만 저장한다."""
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    if not scoring_items_for_standardization(config):
+        return jsonify({"error": "분석할 평가 항목 또는 문항이 없습니다."}), 400
+
+    data = request.get_json(silent=True) or {}
+    try:
+        evidence = collect_standardization_evidence(
+            config, data.get("round_ids", [])
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    instruction = str(data.get("teacher_instruction", "")).strip()
+    prompt = build_standardization_prompt(
+        config, evidence, teacher_instruction=instruction
+    )
+    try:
+        provider = get_provider(config, load_api_keys())
+        generated = provider.generate_json(
+            prompt,
+            schema=standardization_schema(config.project_type),
+            model_name=config.ai_model,
+            temperature=0.2,
+        )
+    except ProviderNeedsUserAction as exc:
+        return jsonify({
+            "error": str(exc),
+            "needs_user_action": True,
+        }), 409
+    except Exception as exc:
+        return jsonify({
+            "error": f"선채점 기준화 초안 생성 실패: {str(exc)[:400]}"
+        }), 500
+
+    session = create_standardization_session(
+        config,
+        evidence=evidence,
+        generated=generated,
+        teacher_instruction=instruction,
+    )
+    return jsonify(_standardization_detail(config, session))
+
+
+def scoring_items_for_standardization(config: ProjectConfig) -> list:
+    """순환 import 없이 공통 평가 단위의 존재만 확인한다."""
+    if config.project_type == "exam":
+        return config.exam.scored_questions()
+    return config.all_criteria
+
+
+@app.route(
+    "/api/projects/<project_id>/standardizations/<session_id>",
+    methods=["GET"],
+)
+def api_standardization_detail(project_id, session_id):
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    session = get_standardization_session(project_id, session_id)
+    if not session:
+        return jsonify({"error": "기준화 초안을 찾을 수 없습니다."}), 404
+    return jsonify(_standardization_detail(config, session))
+
+
+@app.route(
+    "/api/projects/<project_id>/standardizations/<session_id>/draft",
+    methods=["PUT"],
+)
+def api_update_standardization_draft(project_id, session_id):
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    data = request.get_json(silent=True) or {}
+    try:
+        existing = get_standardization_session(project_id, session_id)
+        if not existing:
+            raise LookupError("기준화 초안을 찾을 수 없습니다.")
+        if (
+            existing.get("base_criteria_fingerprint")
+            and existing["base_criteria_fingerprint"]
+            != standardization_criteria_fingerprint(config)
+        ):
+            return jsonify({
+                "error": (
+                    "초안을 만든 뒤 현재 평가기준이 바뀌었습니다. "
+                    "이 초안은 보존되지만 현재 기준에는 적용할 수 없습니다."
+                ),
+                "criteria_changed": True,
+            }), 409
+        session = update_standardization_draft(
+            config, session_id, data.get("draft") or {}
+        )
+    except LookupError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 409
+    return jsonify(_standardization_detail(config, session))
+
+
+@app.route(
+    "/api/projects/<project_id>/standardizations/<session_id>/approve",
+    methods=["POST"],
+)
+def api_approve_standardization(project_id, session_id):
+    """교사가 승인한 초안만 새 승인 평가기준 버전으로 적용한다."""
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    data = request.get_json(silent=True) or {}
+    try:
+        session = get_standardization_session(project_id, session_id)
+        if not session:
+            raise LookupError("기준화 초안을 찾을 수 없습니다.")
+        if (
+            session.get("base_criteria_fingerprint")
+            and session["base_criteria_fingerprint"]
+            != standardization_criteria_fingerprint(config)
+        ):
+            return jsonify({
+                "error": (
+                    "초안을 만든 뒤 현재 평가기준이 바뀌었습니다. "
+                    "현재 기준으로 새 기준화 초안을 만들거나 먼저 이전 기준 버전을 복원하세요."
+                ),
+                "criteria_changed": True,
+            }), 409
+        if isinstance(data.get("draft"), dict):
+            session = update_standardization_draft(
+                config, session_id, data["draft"]
+            )
+        draft_validation = validate_standardization_draft(
+            config, session.get("draft", {})
+        )
+        if not draft_validation["valid"]:
+            return jsonify({
+                "error": "초안의 배점 또는 평가 단위 오류를 먼저 수정하세요.",
+                "validation": draft_validation,
+            }), 409
+        delivery_mode = str(
+            data.get("delivery_mode")
+            or ("core" if config.project_type == "exam" else "core")
+        )
+        candidate = apply_standardization_draft(
+            config,
+            session["draft"],
+            delivery_mode=delivery_mode,
+        )
+    except LookupError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 409
+
+    validation = _criteria_validation(candidate)
+    if validation["errors"]:
+        return jsonify({
+            "error": "기준화 초안을 적용한 평가기준에 오류가 있습니다.",
+            "validation": validation,
+        }), 409
+
+    teacher_note = str(data.get("teacher_note", "")).strip()
+    note = teacher_note or (
+        f"선채점 {', '.join(str(value) for value in session['source_round_ids'])}"
+        "회차 기준화"
+    )
+    entry = snapshot_criteria(
+        candidate,
+        source="synthesized",
+        note=note,
+    )
+    candidate.criteria_state.active_version = entry["version"]
+    candidate.criteria_state.status = "draft"
+    candidate.criteria_state.source = "synthesized"
+    candidate.criteria_state.updated_at = entry["created_at"]
+    save_project(candidate)
+
+    approved_entry = approve_criteria(candidate.id, entry["version"])
+    if not approved_entry:
+        return jsonify({"error": "새 평가기준 버전을 승인하지 못했습니다."}), 500
+    candidate.criteria_state.approved_version = entry["version"]
+    candidate.criteria_state.status = "approved"
+    candidate.criteria_state.updated_at = approved_entry["approved_at"]
+    save_project(candidate)
+    session = mark_standardization_approved(
+        candidate.id,
+        session_id,
+        approved_version=entry["version"],
+        teacher_note=teacher_note,
+    )
+    return jsonify({
+        "success": True,
+        "project": candidate.to_dict(),
+        "version": criteria_version_summary(approved_entry),
+        "validation": validation,
+        **_standardization_detail(candidate, session),
+    })
+
+
+@app.route(
+    "/api/projects/<project_id>/standardizations/<session_id>/discard",
+    methods=["POST"],
+)
+def api_discard_standardization(project_id, session_id):
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    data = request.get_json(silent=True) or {}
+    try:
+        session = discard_standardization_session(
+            project_id,
+            session_id,
+            reason=str(data.get("reason", "")),
+        )
+    except LookupError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 409
+    return jsonify(_standardization_detail(config, session))
 
 
 @app.route("/api/projects/<project_id>", methods=["PUT"])

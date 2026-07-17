@@ -111,6 +111,9 @@ async function selectProject(id, skipTabSwitch) {
   currentProject = await res.json();
   currentSubmissionStatus = null;
   submissionFilesByIndex = [];
+  currentStandardizationWorkspace = null;
+  currentStandardizationSession = null;
+  currentStandardizationSummary = null;
   currentProject.workflow_type = currentProject.workflow_type || (currentProject.project_type === 'exam' ? 'exam' : 'report');
   updateAppShell();
   localStorage.setItem('lastProjectId', id);
@@ -399,6 +402,7 @@ async function populateSettings() {
   const deliveryMode = document.getElementById('reportCriteriaDeliveryMode');
   if (deliveryMode) deliveryMode.value = currentProject.criteria_state?.delivery_mode || 'strict';
   await loadCriteriaVersions();
+  await loadStandardizationWorkspace();
 }
 
 function changeProjectType(value) {
@@ -419,6 +423,10 @@ function updateProjectModeUI() {
   if (reportCriteriaVersionCard) reportCriteriaVersionCard.style.display = isExam ? 'none' : '';
   document.getElementById('reportRubricCard').style.display = isExam ? 'none' : '';
   document.getElementById('reportPromptCard').style.display = isExam ? 'none' : '';
+  const reportStandardizationCard = document.getElementById('reportStandardizationCard');
+  if (reportStandardizationCard) reportStandardizationCard.style.display = isExam ? 'none' : '';
+  const examStandardizationCard = document.getElementById('examStandardizationCard');
+  if (examStandardizationCard) examStandardizationCard.style.display = isExam ? '' : 'none';
   document.getElementById('examIntegratedMaterialsCard').style.display = isExam ? '' : 'none';
   document.getElementById('thApproval').style.display = isExam ? '' : 'none';
   const rankingCard = document.getElementById('competitionRankingCard');
@@ -876,53 +884,473 @@ function removeExamQuestion(index) {
   renderExamQuestions();
 }
 
-let rubricSynthesisDraft = null;
+let currentStandardizationWorkspace = null;
+let currentStandardizationSession = null;
+let currentStandardizationSummary = null;
 
-async function synthesizeRubricFromResults() {
-  if (!currentProject) return alert('프로젝트를 먼저 선택하세요');
-  const status = document.getElementById('rubricSynthesisStatus');
-  const preview = document.getElementById('rubricSynthesisPreview');
-  document.getElementById('applySynthesisBtn').style.display = 'none';
-  preview.innerHTML = '';
-  status.textContent = '⏳ 전체 채점 결과를 종합하는 중... (1~2분)';
-  try {
-    const res = await fetch(`/api/projects/${currentProject.id}/exam/synthesize-rubric`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || '종합 실패');
-    rubricSynthesisDraft = data;
-    preview.innerHTML = data.questions.map(q => `<div class="card" style="background:var(--surface2)">
-      <strong>${esc(q.number)}번 (배점 ${q.max_score}점)</strong>
-      <p style="margin:6px 0"><strong>예시답안:</strong> ${esc(q.model_answer || '-')}</p>
-      <p style="margin:6px 0 2px"><strong>부분점 기준안:</strong></p>
-      <ul style="margin:0 0 6px 18px">${(q.scoring_elements || []).map(e =>
-        `<li>${e.points}점 (${e.required === false ? '선택' : '필수'}) - ${esc(e.description)}</li>`).join('') || '<li>-</li>'}</ul>
-      <p style="margin:6px 0"><strong>정답 인정 답안:</strong> ${esc((q.accepted_answers || []).join(' / ') || '-')}</p>
-      <p style="margin:6px 0"><strong>감점·오답 사례:</strong> ${esc((q.common_errors || []).join(' / ') || '-')}</p>
-      ${q.rationale ? `<p style="margin:6px 0;color:var(--text2);font-size:.85rem">종합 근거: ${esc(q.rationale)}</p>` : ''}
-    </div>`).join('');
-    document.getElementById('applySynthesisBtn').style.display = '';
-    status.textContent = `✅ ${data.round_id}회차 학생 ${data.student_count}명 결과 종합 완료 - 검토 후 반영하세요.`;
-  } catch (e) { status.textContent = `❌ ${e.message}`; }
+function standardizationPrefix() {
+  return currentProject?.project_type === 'exam' ? 'exam' : 'report';
 }
 
-function applyRubricSynthesis() {
-  if (!rubricSynthesisDraft || !currentProject?.exam) return;
-  const byNumber = {};
-  for (const d of rubricSynthesisDraft.questions) byNumber[String(d.number).trim()] = d;
-  for (const q of currentProject.exam.questions) {
-    const d = byNumber[String(q.number).trim()];
-    if (!d) continue;
-    if (d.model_answer) q.model_answer = d.model_answer;
-    if ((d.scoring_elements || []).length) q.scoring_elements = d.scoring_elements;
-    if ((d.accepted_answers || []).length) q.accepted_answers = d.accepted_answers;
-    if ((d.common_errors || []).length) q.common_errors = d.common_errors;
+function standardizationElement(suffix) {
+  return document.getElementById(`${standardizationPrefix()}Standardization${suffix}`);
+}
+
+function standardizationStatusLabel(status) {
+  return ({
+    draft: '교사 검토 중',
+    approved: '교사 승인 완료',
+    discarded: '폐기됨',
+  })[status] || '초안 없음';
+}
+
+function standardizationRoundSignature(round) {
+  return [
+    round.criteria_fingerprint || '',
+    round.criteria_version || 0,
+    round.provider || '',
+    round.model || '',
+  ].join('|');
+}
+
+function defaultStandardizationRounds(rounds) {
+  if (!rounds.length) return [];
+  const latest = rounds[rounds.length - 1];
+  const signature = standardizationRoundSignature(latest);
+  return rounds
+    .filter(round => standardizationRoundSignature(round) === signature)
+    .slice(-2)
+    .map(round => round.id);
+}
+
+async function loadStandardizationWorkspace(options = {}) {
+  if (!currentProject) return;
+  const roundsElement = standardizationElement('Rounds');
+  if (!roundsElement) return;
+  try {
+    const response = await fetch(`/api/projects/${currentProject.id}/standardizations`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || '기준화 작업을 불러오지 못했습니다.');
+    currentStandardizationWorkspace = data;
+    renderStandardizationWorkspace(options);
+  } catch (error) {
+    roundsElement.innerHTML = `<div class="criteria-error">${esc(error.message)}</div>`;
   }
-  pendingCriteriaSource = 'synthesized';
-  renderExamQuestions();
-  document.getElementById('rubricSynthesisStatus').textContent =
-    '✅ 문항 설정에 반영됨 - 위에서 내용을 검토한 뒤 "문항 저장"을 누르세요.';
+}
+
+function renderStandardizationWorkspace(options = {}) {
+  const workspace = currentStandardizationWorkspace || { rounds: [], sessions: [] };
+  const rounds = workspace.rounds || [];
+  const selected = new Set(
+    options.roundIds
+    || currentStandardizationSession?.source_round_ids
+    || defaultStandardizationRounds(rounds)
+  );
+  const roundsElement = standardizationElement('Rounds');
+  roundsElement.innerHTML = rounds.length
+    ? rounds.map(round => `<label class="standardization-round-option">
+        <input type="checkbox" value="${round.id}" ${selected.has(round.id) ? 'checked' : ''}>
+        <span>
+          <strong>${round.id}회차 · ${round.completed_count}/${round.target_count || round.completed_count}명</strong>
+          <small>${esc(round.provider || '이전 방식')} · ${esc(round.model || '모델 기록 없음')} · 기준 v${round.criteria_version || '미저장'}</small>
+        </span>
+      </label>`).join('')
+    : '<div class="empty-state compact"><p>완료된 선채점 회차가 없습니다. 먼저 AI 채점을 실행하세요.</p></div>';
+
+  const sessions = workspace.sessions || [];
+  const sessionSelect = standardizationElement('Session');
+  sessionSelect.innerHTML = sessions.length
+    ? sessions.map(session => `<option value="${esc(session.id)}">${
+        formatDateTime(session.created_at)} · ${standardizationStatusLabel(session.status)} · ${
+        (session.source_round_ids || []).join('·')}회차${session.approved_version ? ` · 기준 v${session.approved_version}` : ''}</option>`).join('')
+    : '<option value="">저장된 기준화 작업 없음</option>';
+  const requestedSessionId = options.sessionId
+    || currentStandardizationSession?.id
+    || sessions.find(session => session.status === 'draft')?.id
+    || sessions[0]?.id
+    || '';
+  if (requestedSessionId && sessions.some(session => session.id === requestedSessionId)) {
+    sessionSelect.value = requestedSessionId;
+    if (!currentStandardizationSession || currentStandardizationSession.id !== requestedSessionId) {
+      selectStandardizationSession(requestedSessionId);
+      return;
+    }
+  } else {
+    currentStandardizationSession = null;
+    currentStandardizationSummary = null;
+    renderStandardizationSession();
+  }
+
+  const generateButton = standardizationElement('Generate');
+  if (generateButton) generateButton.disabled = !rounds.length;
+  const state = standardizationElement('State');
+  state.textContent = sessions.length
+    ? `${sessions.length}개 작업 보존`
+    : (rounds.length ? '초안 생성 가능' : '선채점 필요');
+  state.className = `criteria-state-badge ${rounds.length ? 'state-draft' : 'state-empty'}`;
+}
+
+async function selectStandardizationSession(sessionId) {
+  if (!currentProject || !sessionId) {
+    currentStandardizationSession = null;
+    currentStandardizationSummary = null;
+    renderStandardizationSession();
+    return;
+  }
+  const status = standardizationElement('Status');
+  status.textContent = '저장된 기준화 초안을 불러오는 중...';
+  const response = await fetch(
+    `/api/projects/${currentProject.id}/standardizations/${encodeURIComponent(sessionId)}`
+  );
+  const data = await response.json();
+  if (!response.ok) {
+    status.textContent = `❌ ${data.error || '초안을 불러오지 못했습니다.'}`;
+    return;
+  }
+  currentStandardizationSession = data.session;
+  currentStandardizationSummary = data.summary;
+  const sessionSelect = standardizationElement('Session');
+  if (sessionSelect) sessionSelect.value = sessionId;
+  renderStandardizationSession();
+}
+
+function selectedStandardizationRounds() {
+  return [...standardizationElement('Rounds').querySelectorAll('input[type="checkbox"]:checked')]
+    .map(input => Number(input.value))
+    .filter(Number.isFinite);
+}
+
+async function generateStandardization() {
+  if (!currentProject) return;
+  const roundIds = selectedStandardizationRounds();
+  if (!roundIds.length) return alert('기준화에 사용할 완료 회차를 선택하세요.');
+  const costNote = '기준화 초안 생성에는 AI 요청 1회가 사용됩니다. 실제 평가기준은 교사 승인 전까지 바뀌지 않습니다.';
+  if (!confirm(`${roundIds.join('·')}회차를 함께 분석합니다.\n\n${costNote}\n\n계속할까요?`)) return;
+  const status = standardizationElement('Status');
+  const button = standardizationElement('Generate');
+  button.disabled = true;
+  status.textContent = '⏳ 답안 유형과 채점 차이를 분석해 기준화 초안을 만드는 중입니다...';
+  try {
+    const response = await fetch(`/api/projects/${currentProject.id}/standardizations`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        round_ids: roundIds,
+        teacher_instruction: standardizationElement('Instruction').value.trim(),
+      }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || '기준화 초안 생성 실패');
+    currentStandardizationSession = data.session;
+    currentStandardizationSummary = data.summary;
+    status.textContent = `✅ ${data.session.student_count}명 · ${data.session.observation_count}개 채점 근거로 초안을 만들었습니다. 교사가 내용을 확인하세요.`;
+    await loadStandardizationWorkspace({ sessionId: data.session.id, roundIds });
+  } catch (error) {
+    status.textContent = `❌ ${error.message}`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function standardizationEvidenceBadge(strength) {
+  const label = ({ strong: '근거 충분', moderate: '근거 보통', weak: '근거 약함' })[strength] || '근거 확인';
+  return `<span class="standardization-evidence evidence-${esc(strength || 'weak')}">${label}</span>`;
+}
+
+function standardizationListText(values) {
+  return (values || []).join('\n');
+}
+
+function standardizationScoringText(values) {
+  return (values || [])
+    .map(value => `${value.points}|${value.required === false ? '선택' : '필수'}|${value.description}`)
+    .join('\n');
+}
+
+function renderStandardizationSession() {
+  const session = currentStandardizationSession;
+  const editor = standardizationElement('Draft');
+  const validation = standardizationElement('Validation');
+  const saveButton = standardizationElement('Save');
+  const approveButton = standardizationElement('Approve');
+  const discardButton = standardizationElement('Discard');
+  const sample = standardizationElement('Sample');
+  if (!session) {
+    editor.innerHTML = '<div class="empty-state"><p>선채점 회차를 선택해 기준화 초안을 만드세요.</p></div>';
+    validation.innerHTML = '';
+    saveButton.disabled = true;
+    approveButton.disabled = true;
+    discardButton.disabled = true;
+    sample.style.display = 'none';
+    return;
+  }
+
+  const isDraft = session.status === 'draft';
+  const draft = session.draft || {};
+  const items = currentProject.project_type === 'exam'
+    ? (draft.questions || [])
+    : (draft.criteria || []);
+  const overall = draft.overall_note
+    ? `<div class="info-callout standardization-overall"><strong>AI 종합 메모</strong><p>${esc(draft.overall_note)}</p></div>`
+    : '';
+  editor.innerHTML = overall + items.map(item => (
+    currentProject.project_type === 'exam'
+      ? renderExamStandardizationItem(item, isDraft)
+      : renderReportStandardizationItem(item, isDraft)
+  )).join('');
+
+  const draftValidation = session.draft_validation || {};
+  const warningMessages = [
+    ...(currentStandardizationSummary?.criteria_changed
+      ? ['<div class="criteria-error">❌ 이 초안을 만든 뒤 현재 평가기준이 바뀌었습니다. 현재 기준으로 새 초안을 만들거나 이전 기준 버전을 복원하세요.</div>']
+      : []),
+    ...(session.warnings || []).map(message => `<div class="criteria-warning">⚠️ ${esc(message)}</div>`),
+    ...(draftValidation.errors || []).map(message => `<div class="criteria-error">❌ ${esc(message)}</div>`),
+    ...(draftValidation.warnings || []).map(message => `<div class="criteria-warning">⚠️ ${esc(message)}</div>`),
+  ];
+  if (!warningMessages.length) {
+    warningMessages.push(`<div class="criteria-ok">✅ ${session.source_round_ids.join('·')}회차 · ${session.student_count}명 · 채점 근거 ${session.observation_count}건</div>`);
+  }
+  validation.innerHTML = warningMessages.join('');
+  const criteriaChanged = Boolean(currentStandardizationSummary?.criteria_changed);
+  saveButton.disabled = !isDraft || criteriaChanged;
+  approveButton.disabled = !isDraft || criteriaChanged || Boolean(draftValidation.errors?.length);
+  discardButton.disabled = !isDraft;
+  standardizationElement('State').textContent = standardizationStatusLabel(session.status)
+    + (session.approved_version ? ` · 기준 v${session.approved_version}` : '');
+  standardizationElement('State').className = `criteria-state-badge state-${session.status === 'approved' ? 'approved' : (session.status === 'draft' ? 'draft' : 'modified')}`;
+  standardizationElement('TeacherNote').value = session.teacher_note || '';
+  sample.style.display = session.status === 'approved' ? '' : 'none';
+  if (session.status === 'approved') {
+    const recommendations = session.recommended_sample_teams || [];
+    const teamInput = standardizationElement('SampleTeams');
+    teamInput.value = recommendations.map(item => item.team_number).join(', ');
+    renderStandardizationComparison(currentStandardizationSummary?.comparison);
+  }
+}
+
+function disabledAttribute(editable) {
+  return editable ? '' : 'disabled';
+}
+
+function renderExamStandardizationItem(item, editable) {
+  const disabled = disabledAttribute(editable);
+  return `<div class="standardization-draft-item" data-item-id="${esc(item.id)}" data-kind="exam">
+    <div class="standardization-item-heading">
+      <div><strong>${esc(item.number)}번 · ${item.max_score}점</strong><small>${esc(item.question_text || '')}</small></div>
+      ${standardizationEvidenceBadge(item.evidence_strength)}
+    </div>
+    ${item.change_summary ? `<p class="standardization-change"><strong>제안 변화:</strong> ${esc(item.change_summary)}</p>` : ''}
+    <div class="form-group"><label>모범 답안</label><textarea data-field="model_answer" rows="3" ${disabled}>${esc(item.model_answer || '')}</textarea></div>
+    <div class="standardization-grid">
+      <div class="form-group"><label>부분점 기준 — 점수|필수/선택|설명</label><textarea data-field="scoring_elements" rows="5" ${disabled}>${esc(standardizationScoringText(item.scoring_elements))}</textarea></div>
+      <div class="form-group"><label>AI용 핵심 기준 — 한 줄에 하나</label><textarea data-field="core_criteria" rows="5" ${disabled}>${esc(standardizationListText(item.core_criteria))}</textarea></div>
+      <div class="form-group"><label>정답 인정 표현</label><textarea data-field="accepted_answers" rows="4" ${disabled}>${esc(standardizationListText(item.accepted_answers))}</textarea></div>
+      <div class="form-group"><label>감점·오답 사례</label><textarea data-field="common_errors" rows="4" ${disabled}>${esc(standardizationListText(item.common_errors))}</textarea></div>
+      <div class="form-group"><label>경계 사례 — 자동 인정하지 않고 교사 확인</label><textarea data-field="boundary_cases" rows="4" ${disabled}>${esc(standardizationListText(item.boundary_cases))}</textarea></div>
+      <div class="form-group"><label>교사 메모</label><textarea data-field="teacher_notes" rows="4" ${disabled}>${esc(item.teacher_notes || '')}</textarea></div>
+    </div>
+    ${item.rationale ? `<details><summary>AI 제안 근거</summary><p>${esc(item.rationale)}</p></details>` : ''}
+  </div>`;
+}
+
+function renderReportStandardizationItem(item, editable) {
+  const disabled = disabledAttribute(editable);
+  return `<div class="standardization-draft-item" data-item-id="${esc(item.id)}" data-kind="report">
+    <div class="standardization-item-heading">
+      <div><strong>${esc(item.category)} · ${esc(item.name)}</strong><small>기존 척도 ${esc((item.scale || []).join(' / '))}점 유지</small></div>
+      ${standardizationEvidenceBadge(item.evidence_strength)}
+    </div>
+    ${item.change_summary ? `<p class="standardization-change"><strong>제안 변화:</strong> ${esc(item.change_summary)}</p>` : ''}
+    <div class="form-group"><label>상세 평가 설명</label><textarea data-field="description" rows="3" ${disabled}>${esc(item.description || '')}</textarea></div>
+    <div class="standardization-grid">
+      <div class="form-group"><label>필수 확인 요소</label><textarea data-field="required_elements" rows="4" ${disabled}>${esc(standardizationListText(item.required_elements))}</textarea></div>
+      <div class="form-group"><label>감점 규칙</label><textarea data-field="deduction_rules" rows="4" ${disabled}>${esc(standardizationListText(item.deduction_rules))}</textarea></div>
+      <div class="form-group"><label>예외·인정 기준</label><textarea data-field="exceptions" rows="4" ${disabled}>${esc(standardizationListText(item.exceptions))}</textarea></div>
+      <div class="form-group"><label>AI용 핵심 기준</label><textarea data-field="core_criteria" rows="4" ${disabled}>${esc(standardizationListText(item.core_criteria))}</textarea></div>
+      <div class="form-group"><label>경계 사례 — 자동 인정하지 않고 교사 확인</label><textarea data-field="boundary_cases" rows="4" ${disabled}>${esc(standardizationListText(item.boundary_cases))}</textarea></div>
+      <div class="form-group"><label>피드백 관점</label><textarea data-field="feedback_focus" rows="4" ${disabled}>${esc(item.feedback_focus || '')}</textarea></div>
+    </div>
+    ${item.rationale ? `<details><summary>AI 제안 근거</summary><p>${esc(item.rationale)}</p></details>` : ''}
+  </div>`;
+}
+
+function standardizationLines(value) {
+  return value.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+}
+
+function parseStandardizationScoring(value) {
+  return standardizationLines(value).map(line => {
+    const parts = line.split('|');
+    const points = Number(parts.shift());
+    const requirement = (parts.shift() || '필수').trim();
+    const description = parts.join('|').trim();
+    return {
+      points,
+      required: !['선택', 'optional', 'false'].includes(requirement.toLowerCase()),
+      description,
+    };
+  }).filter(item => Number.isInteger(item.points) && item.points > 0 && item.description);
+}
+
+function collectStandardizationDraft() {
+  if (!currentStandardizationSession) return null;
+  const draft = JSON.parse(JSON.stringify(currentStandardizationSession.draft || {}));
+  const key = currentProject.project_type === 'exam' ? 'questions' : 'criteria';
+  const byId = Object.fromEntries((draft[key] || []).map(item => [item.id, item]));
+  standardizationElement('Draft').querySelectorAll('.standardization-draft-item').forEach(element => {
+    const item = byId[element.dataset.itemId];
+    if (!item) return;
+    element.querySelectorAll('[data-field]').forEach(input => {
+      const field = input.dataset.field;
+      if (field === 'scoring_elements') item[field] = parseStandardizationScoring(input.value);
+      else if (['core_criteria', 'accepted_answers', 'common_errors', 'boundary_cases',
+        'required_elements', 'deduction_rules', 'exceptions'].includes(field)) {
+        item[field] = standardizationLines(input.value);
+      } else item[field] = input.value.trim();
+    });
+  });
+  return draft;
+}
+
+async function saveStandardizationDraft(options = {}) {
+  if (!currentProject || currentStandardizationSession?.status !== 'draft') return false;
+  const draft = collectStandardizationDraft();
+  const response = await fetch(
+    `/api/projects/${currentProject.id}/standardizations/${encodeURIComponent(currentStandardizationSession.id)}/draft`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ draft }),
+    }
+  );
+  const data = await response.json();
+  if (!response.ok) {
+    if (!options.silent) alert(data.error || '기준화 초안 저장 실패');
+    return false;
+  }
+  currentStandardizationSession = data.session;
+  currentStandardizationSummary = data.summary;
+  renderStandardizationSession();
+  if (!options.silent) standardizationElement('Status').textContent = '✅ 수정한 기준화 초안을 저장했습니다.';
+  return true;
+}
+
+async function approveStandardization() {
+  if (!currentProject || currentStandardizationSession?.status !== 'draft') return;
+  const draft = collectStandardizationDraft();
+  const versionText = currentProject.criteria_state?.approved_version
+    ? `현재 승인 기준 v${currentProject.criteria_state.approved_version}은 그대로 보존됩니다.`
+    : '현재 기준도 버전 기록에 보존됩니다.';
+  if (!confirm(
+    `이 기준화 초안을 교사 승인하고 새 평가기준 버전으로 적용할까요?\n\n${versionText}\n승인 뒤에는 추천 표본만 먼저 재채점합니다. 전원 재채점은 자동으로 실행되지 않습니다.`
+  )) return;
+  const status = standardizationElement('Status');
+  status.textContent = '⏳ 초안을 검증하고 새 승인 기준 버전으로 저장하는 중...';
+  const response = await fetch(
+    `/api/projects/${currentProject.id}/standardizations/${encodeURIComponent(currentStandardizationSession.id)}/approve`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        draft,
+        delivery_mode: standardizationElement('Delivery').value,
+        teacher_note: standardizationElement('TeacherNote').value.trim(),
+      }),
+    }
+  );
+  const data = await response.json();
+  if (!response.ok) {
+    const details = data.validation?.errors?.join('\n');
+    status.textContent = `❌ ${data.error || '기준화 승인 실패'}`;
+    if (details) alert(details);
+    return;
+  }
+  currentProject = data.project;
+  currentStandardizationSession = data.session;
+  currentStandardizationSummary = data.summary;
+  status.textContent = `✅ 기준 v${data.version.version}으로 교사 승인했습니다. 전체 재채점 전에 추천 표본을 확인하세요.`;
+  await populateSettings();
+}
+
+async function discardStandardization() {
+  if (!currentProject || currentStandardizationSession?.status !== 'draft') return;
+  if (!confirm('이 기준화 초안을 폐기할까요? 선채점 회차와 기존 평가기준은 삭제되지 않습니다.')) return;
+  const response = await fetch(
+    `/api/projects/${currentProject.id}/standardizations/${encodeURIComponent(currentStandardizationSession.id)}/discard`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    }
+  );
+  const data = await response.json();
+  if (!response.ok) return alert(data.error || '기준화 초안 폐기 실패');
+  currentStandardizationSession = data.session;
+  currentStandardizationSummary = data.summary;
+  await loadStandardizationWorkspace({ sessionId: data.session.id });
+}
+
+async function startStandardizationSample() {
+  if (!currentProject || currentStandardizationSession?.status !== 'approved') return;
+  const numbers = standardizationElement('SampleTeams').value
+    .split(',')
+    .map(value => Number(value.trim()))
+    .filter(value => Number.isInteger(value) && value > 0);
+  if (!numbers.length) return alert('표본 재채점할 학생 번호를 입력하세요.');
+  const started = await startGrading(numbers, {
+    mode: 'new',
+    new_round: true,
+    repeat_count: 1,
+    start_from: 1,
+  });
+  if (started === true) showWorkspaceStage('grading');
+}
+
+function standardizationMetric(value) {
+  return value == null ? '측정 불가' : `${value}점`;
+}
+
+function renderStandardizationComparison(comparison) {
+  const element = standardizationElement('Comparison');
+  if (!comparison || comparison.status !== 'ready') {
+    const reason = comparison?.verdict_reasons?.[0]
+      || '추천 표본을 새 승인 기준으로 채점하면 이곳에 변경 전후 비교가 표시됩니다.';
+    element.innerHTML = `<div class="info-callout"><strong>표본 검증 대기</strong><p>${esc(reason)}</p></div>`;
+    return;
+  }
+  const verdictLabel = ({
+    improved: '개선 신호',
+    mixed: '혼합 결과',
+    worse: '재검토 필요',
+    insufficient: '측정 자료 부족',
+  })[comparison.verdict] || '결과 확인';
+  const before = comparison.summary?.before || {};
+  const after = comparison.summary?.after || {};
+  element.innerHTML = `
+    <div class="standardization-comparison-head verdict-${esc(comparison.verdict)}">
+      <div><span>표본 ${comparison.summary.student_count}명 · 기준 v${comparison.approved_version}</span><strong>${verdictLabel}</strong></div>
+      <small>기존 ${comparison.baseline_round_ids.join('·')}회차 → 표본 ${comparison.validation_round_ids.join('·')}회차</small>
+    </div>
+    <div class="standardization-metrics">
+      <div><span>수동 점수 평균 오차</span><strong>${standardizationMetric(before.manual_mae)} → ${standardizationMetric(after.manual_mae)}</strong></div>
+      <div><span>회차 간 평균 표준편차</span><strong>${standardizationMetric(before.mean_within_student_std)} → ${standardizationMetric(after.mean_within_student_std)}</strong></div>
+      <div><span>평균 점수 변화</span><strong>${comparison.summary.mean_score_delta == null ? '측정 불가' : `${comparison.summary.mean_score_delta > 0 ? '+' : ''}${comparison.summary.mean_score_delta}점`}</strong></div>
+    </div>
+    <div class="standardization-verdict-reasons">${(comparison.verdict_reasons || []).map(reason => `<p>• ${esc(reason)}</p>`).join('')}</div>
+    <details>
+      <summary>학생별·항목별 변화 보기</summary>
+      <div class="table-wrap"><table><thead><tr><th>번호</th><th>변경 전</th><th>변경 후</th><th>차이</th><th>수동</th></tr></thead>
+      <tbody>${(comparison.students || []).map(student => `<tr>
+        <td>${student.team_number}번</td><td>${student.before}</td><td>${student.after}</td>
+        <td>${student.delta > 0 ? '+' : ''}${student.delta}</td><td>${student.manual_score ?? '-'}</td>
+      </tr>`).join('')}</tbody></table></div>
+      <div class="standardization-item-comparison">${(comparison.items || []).map(item => `<div>
+        <strong>${esc(item.label)}</strong>
+        <span>수동 오차 ${standardizationMetric(item.before.manual_mae)} → ${standardizationMetric(item.after.manual_mae)}</span>
+        <span>회차 편차 ${standardizationMetric(item.before.mean_within_student_std)} → ${standardizationMetric(item.after.mean_within_student_std)}</span>
+      </div>`).join('')}</div>
+    </details>`;
 }
 
 function updateExamGradingMode(value) {
@@ -2048,6 +2476,7 @@ async function startGrading(teamNumbers = null, options = {}) {
   renderGradingGrid();
   loadGradingRounds();
   connectSSE();
+  return true;
 }
 
 async function stopGrading() {
