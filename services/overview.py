@@ -5,6 +5,7 @@ from __future__ import annotations
 from config import PROJECTS_DIR  # 기존 테스트·확장 모듈의 경로 주입 호환성 유지
 from models.project import ProjectConfig
 from services.grading import load_completed, list_round_summaries
+from services.review import build_review_dashboard
 from services.submissions import build_submission_status
 
 
@@ -75,9 +76,21 @@ def build_project_overview(config: ProjectConfig) -> dict:
     rounds = _round_summaries(config, participant_count)
     latest_round = rounds[-1] if rounds else None
     completed_count = latest_round["completed_count"] if latest_round else 0
-    approved_count = latest_round["approved_count"] if latest_round else 0
-    pending_count = latest_round["pending_count"] if latest_round else 0
-    review_required_count = latest_round["review_required_count"] if latest_round else 0
+    participant_numbers = [
+        int(entry["number"])
+        for entry in submission_status["entries"]
+        if entry.get("files")
+    ]
+    review_dashboard = build_review_dashboard(
+        config,
+        participant_numbers=participant_numbers,
+    )
+    review_summary = review_dashboard["summary"]
+    approved_count = review_summary["approved_count"]
+    pending_count = review_summary["pending_count"]
+    review_required_count = review_summary["attention_count"]
+    stale_count = review_summary["stale_count"]
+    effective_approved_count = max(0, approved_count - stale_count)
 
     criteria_ready = criteria_count > 0
     submissions_ready = submission_status["all_ready"]
@@ -91,11 +104,11 @@ def build_project_overview(config: ProjectConfig) -> dict:
     ]
     # AI 신뢰도 비교를 위해 전체 대상 독립 채점 2회를 기본 완료 조건으로 둔다.
     grading_complete = len(completed_full_rounds) >= 2
-    if config.project_type == "exam":
-        review_complete = grading_complete and completed_count > 0 and approved_count >= completed_count
-    else:
-        # 보고서 엔진의 교사 승인 모델은 후속 단계에서 추가한다.
-        review_complete = grading_complete
+    review_complete = bool(
+        grading_complete
+        and participant_count > 0
+        and effective_approved_count >= participant_count
+    )
 
     if not criteria_ready:
         next_action = {
@@ -133,11 +146,14 @@ def build_project_overview(config: ProjectConfig) -> dict:
             "label": "AI 채점 진행하기",
             "reason": reason,
         }
-    elif config.project_type == "exam" and not review_complete:
+    elif not review_complete:
         next_action = {
             "stage": "review",
             "label": "검토·확정하기",
-            "reason": f"{pending_count or (completed_count - approved_count)}명의 교사 확인이 남았습니다.",
+            "reason": (
+                f"{max(0, participant_count - effective_approved_count)}명의 최종 점수 확정·재확인이 남았습니다. "
+                f"우선 확인 대상은 {review_required_count}명입니다."
+            ),
         }
     else:
         next_action = {
@@ -212,16 +228,16 @@ def build_project_overview(config: ProjectConfig) -> dict:
         "review": {
             "complete": review_complete,
             "approved_count": approved_count,
+            "effective_approved_count": effective_approved_count,
             "pending_count": pending_count,
             "review_required_count": review_required_count,
+            "manual_count": review_summary["manual_count"],
+            "stale_count": stale_count,
             "label": (
-                f"{approved_count}/{completed_count}명 확정"
-                if config.project_type == "exam" and completed_count
-                else (
-                    f"검토할 결과 {completed_count}명"
-                    if completed_count
-                    else "채점 결과 없음"
-                )
+                f"{effective_approved_count}/{participant_count}명 최종 확정"
+                f" · 우선 확인 {review_required_count}명"
+                if participant_count
+                else "채점 결과 없음"
             ),
         },
         "rounds": rounds,

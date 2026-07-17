@@ -250,3 +250,51 @@ tr.clickable{cursor:pointer}
   .round-failure-item{grid-template-columns:1fr}
   .round-failure-item .failure-action{grid-column:1}
 }
+
+/* 교사 통합 검토·최종 확정 */
+.review-stats{grid-template-columns:repeat(4,minmax(120px,1fr))}
+.review-controls{display:grid;grid-template-columns:minmax(260px,1.3fr) minmax(360px,1.5fr) minmax(130px,.55fr) auto;gap:14px;align-items:end;margin-bottom:14px}
+.review-controls>div>label,.review-thresholds label{display:block;color:var(--text2);font-size:.76rem;font-weight:600;margin-bottom:6px}
+.review-controls select,.review-thresholds input{padding:7px 9px;background:var(--surface2);border:1px solid var(--border);border-radius:7px;color:var(--text);font-family:inherit}
+.round-check-list{display:flex;gap:7px;flex-wrap:wrap}
+.round-check{display:flex;align-items:center;gap:5px;padding:6px 9px;border:1px solid var(--border);border-radius:7px;background:var(--surface2);font-size:.76rem;cursor:pointer}
+.round-check:has(input:checked){border-color:var(--primary2);background:rgba(99,102,241,.1)}
+.round-check small{color:var(--text2)}
+.review-thresholds{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}
+.review-thresholds label{margin:0}
+.review-thresholds input{display:block;width:100%;margin-top:6px}
+.review-table-wrap{max-height:620px;overflow:auto}
+.review-table-wrap table{min-width:1200px}
+.review-row.priority-critical{background:rgba(248,113,113,.035)}
+.review-row.priority-attention{background:rgba(251,191,36,.025)}
+.review-priority{display:inline-flex;padding:3px 7px;border-radius:999px;font-size:.68rem;font-weight:700;white-space:nowrap}
+.review-priority.critical{color:var(--danger);background:rgba(248,113,113,.15)}
+.review-priority.attention{color:var(--warning);background:rgba(251,191,36,.14)}
+.review-priority.normal{color:var(--text2);background:var(--surface3)}
+.round-score-cell{font-size:.74rem;line-height:1.55;white-space:nowrap;color:var(--text2)}
+.review-difference.warning{color:var(--danger);font-weight:700}
+.review-reasons{max-width:210px;margin-top:6px;color:var(--text2);font-size:.68rem;line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.review-loading{text-align:center!important;color:var(--text2);padding:30px!important}
+.review-decision-modal{max-width:1120px}
+.review-summary-strip{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.review-summary-strip span{padding:8px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:7px;color:var(--text2);font-size:.76rem}
+.review-summary-strip strong{color:var(--text);margin-left:4px}
+.review-modal-reasons{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+.review-modal-reasons span{padding:4px 8px;border-radius:999px;background:rgba(251,191,36,.12);color:var(--warning);font-size:.71rem}
+.review-item-table-wrap{max-height:370px;margin:14px 0}
+.review-item-table-wrap table{min-width:820px}
+.review-item-table-wrap td small{display:block;max-width:280px;color:var(--text2);line-height:1.4;margin-top:3px}
+.review-score-input{width:78px;padding:7px 8px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text)}
+.review-decision-form{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.review-decision-actions{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;padding-top:14px;border-top:1px solid var(--border)}
+.review-audit-log{margin:8px 0 16px;color:var(--text2);font-size:.75rem}
+.review-audit-log summary{cursor:pointer;color:var(--accent);font-weight:700}
+.review-audit-entry{display:flex;justify-content:space-between;gap:12px;padding:7px 9px;margin-top:5px;border-radius:6px;background:var(--surface2)}
+@media(max-width:980px){
+  .review-controls{grid-template-columns:1fr 1fr}
+  .review-thresholds{grid-template-columns:1fr}
+}
+@media(max-width:700px){
+  .review-stats{grid-template-columns:repeat(2,1fr)}
+  .review-controls,.review-decision-form{grid-template-columns:1fr}
+}

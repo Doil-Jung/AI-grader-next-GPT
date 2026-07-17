@@ -467,14 +467,67 @@
 <div class="tab-content" id="tab-results">
   <div class="card">
     <div class="section-heading compact">
-      <div><span class="eyebrow">교사 승인 전 결과</span><h2>회차별 채점 결과</h2></div>
+      <div>
+        <span class="eyebrow">AI 원점수 · 수동 점수 · 최종 확정 분리</span>
+        <h2>교사 통합 검토</h2>
+        <p>회차별 AI 점수와 편차, 교사 수동 점수의 차이를 확인한 뒤 최종 점수를 별도로 확정합니다. 확정 전 AI 원점수는 바뀌지 않습니다.</p>
+      </div>
+      <button class="btn btn-secondary btn-sm" onclick="loadReviewDashboard()">새로고침</button>
+    </div>
+    <div class="stats-grid review-stats">
+      <div class="stat-card"><div class="value" id="reviewStudentCount">0</div><div class="label">검토 대상</div></div>
+      <div class="stat-card"><div class="value" id="reviewAttentionCount">0</div><div class="label">우선 확인</div></div>
+      <div class="stat-card"><div class="value" id="reviewManualCount">0</div><div class="label">수동 점수 있음</div></div>
+      <div class="stat-card"><div class="value" id="reviewApprovedCount">0</div><div class="label">최종 확정</div></div>
+    </div>
+    <div class="review-controls">
+      <div>
+        <label>비교할 AI 회차</label>
+        <div id="reviewRoundChecks" class="round-check-list"></div>
+      </div>
+      <div class="review-thresholds">
+        <label>표준편차 <input id="reviewStdThreshold" type="number" min="0" step="0.1" value="1.5"></label>
+        <label>회차 차이 <input id="reviewRangeThreshold" type="number" min="0" step="0.5" value="2"></label>
+        <label>AI-수동 차이 <input id="reviewManualDiffThreshold" type="number" min="0" step="0.5" value="2"></label>
+      </div>
+      <div>
+        <label>표시 대상</label>
+        <select id="reviewFilter" onchange="renderReviewDashboard()">
+          <option value="all">전체</option>
+          <option value="attention">우선 확인</option>
+          <option value="pending">확정 대기</option>
+          <option value="approved">확정 완료</option>
+        </select>
+      </div>
+      <button class="btn btn-primary btn-sm" onclick="loadReviewDashboard()">기준 적용</button>
+    </div>
+    <div id="reviewSelectionNote" class="info-callout" style="margin:0 0 12px"></div>
+    <div class="table-wrap review-table-wrap">
+      <table id="reviewTable">
+        <thead><tr>
+          <th>우선순위</th><th>번호</th><th>이름</th><th>회차별 AI</th>
+          <th>AI 평균</th><th>표준편차</th><th>수동</th><th>AI-수동</th>
+          <th>AI 제안</th><th>최종 확정</th><th>상태</th><th>검토</th>
+        </tr></thead>
+        <tbody id="reviewBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="section-heading compact">
+      <div>
+        <span class="eyebrow">근거 확인과 회차 판정 보정</span>
+        <h2>개별 회차 원본 결과</h2>
+        <p>AI 응답의 항목별 근거를 확인합니다. 여기서 판정을 보정해도 최초 AI 원점수는 비교용으로 별도 보존됩니다.</p>
+      </div>
     </div>
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:16px;flex-wrap:wrap">
       <select id="resultRound" onchange="loadResults()"></select>
       <button class="btn btn-secondary btn-sm" onclick="loadResults()">🔄 새로고침</button>
       <button class="btn btn-primary btn-sm" onclick="downloadResults()">📥 Excel 다운로드</button>
     </div>
-    <div class="table-wrap"><table id="resultsTable"><thead><tr><th style="cursor:pointer;user-select:none" onclick="sortResults('rank')" id="thRank">순위 <span class="sort-arrows">▲▼</span></th><th style="cursor:pointer;user-select:none" onclick="sortResults('number')" id="thNumber">번호 <span class="sort-arrows">▲▼</span></th><th>이름</th><th>총점</th><th id="thApproval" style="display:none">승인</th><th>상세</th></tr></thead><tbody id="resultsBody"></tbody></table></div>
+    <div class="table-wrap"><table id="resultsTable"><thead><tr><th style="cursor:pointer;user-select:none" onclick="sortResults('rank')" id="thRank">순위 <span class="sort-arrows">▲▼</span></th><th style="cursor:pointer;user-select:none" onclick="sortResults('number')" id="thNumber">번호 <span class="sort-arrows">▲▼</span></th><th>이름</th><th>총점</th><th id="thApproval" style="display:none">회차 확인</th><th>상세</th></tr></thead><tbody id="resultsBody"></tbody></table></div>
   </div>
 </div>
 
@@ -498,7 +551,7 @@
         <div style="display:flex;gap:8px;align-items:center">
           <button class="btn btn-secondary btn-sm" onclick="document.getElementById('manualFileInput').click()">📋 Excel 업로드</button>
           <input type="file" id="manualFileInput" accept=".xlsx,.xls,.csv" style="display:none" onchange="uploadManualScores(this)">
-          <label style="display:flex;align-items:center;gap:4px;font-size:.8rem"><input type="checkbox" id="includeManual"> 평균에 포함</label>
+          <label style="display:flex;align-items:center;gap:4px;font-size:.8rem"><input type="checkbox" id="includeManual" checked> 비교표에 표시</label>
           <span id="manualStatus" style="font-size:.8rem;color:var(--text2)"></span>
         </div>
       </div>
@@ -622,6 +675,57 @@
       <span id="wizardValidation" class="wizard-validation"></span>
       <button class="btn btn-primary" id="wizardNextButton" onclick="changeWizardStep(1)">다음</button>
       <button class="btn btn-primary" id="wizardCreateButton" onclick="createProject()" style="display:none">프로젝트 만들기</button>
+    </div>
+  </div>
+</div>
+
+<!-- 모달: 통합 검토와 최종 확정 -->
+<div class="modal-overlay" id="reviewDecisionModal">
+  <div class="modal review-decision-modal">
+    <div class="modal-header">
+      <div>
+        <span class="eyebrow">교사 최종 결정</span>
+        <h2 id="reviewDecisionTitle">통합 검토</h2>
+      </div>
+      <button class="btn-icon" onclick="closeModal('reviewDecisionModal')">✕</button>
+    </div>
+    <div id="reviewDecisionSummary"></div>
+    <div class="table-wrap review-item-table-wrap">
+      <table>
+        <thead><tr>
+          <th>항목·문항</th><th>회차별 AI</th><th>AI 평균</th><th>편차</th>
+          <th>수동 점수</th><th>최종 점수</th>
+        </tr></thead>
+        <tbody id="reviewDecisionItems"></tbody>
+      </table>
+    </div>
+    <div class="review-decision-form">
+      <div class="form-group">
+        <label>수동 총점 — AI 점수와 별도 보존</label>
+        <input id="reviewManualTotal" type="number" min="0" step="0.1">
+      </div>
+      <div class="form-group">
+        <label>최종 확정 총점</label>
+        <input id="reviewFinalTotal" type="number" min="0" step="0.1" oninput="document.getElementById('reviewDecisionSource').value='custom'">
+      </div>
+      <div class="form-group">
+        <label>확정 근거</label>
+        <select id="reviewDecisionSource" onchange="applyReviewDecisionSource()">
+          <option value="ai_suggested">AI 종합 제안</option>
+          <option value="manual">교사 수동 점수</option>
+          <option value="custom">교사 직접 결정</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>교사 메모</label>
+      <textarea id="reviewTeacherNote" rows="3" placeholder="확정 또는 재검토에 필요한 메모를 선택적으로 남깁니다."></textarea>
+    </div>
+    <div id="reviewDecisionAudit" class="review-audit-log"></div>
+    <div class="review-decision-actions">
+      <button class="btn btn-secondary" onclick="saveReviewManualScore()">수동 점수 저장</button>
+      <button class="btn btn-warning" id="reviewReopenButton" onclick="reopenReviewDecision()" style="display:none">확정 취소·재검토</button>
+      <button class="btn btn-success" id="reviewApproveButton" onclick="approveReviewDecision()">교사 승인·최종 확정</button>
     </div>
   </div>
 </div>

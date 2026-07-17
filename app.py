@@ -52,6 +52,10 @@ from services.pdf_splitter import build_split_plan, split_integrated_pdf, SplitV
 from services.providers import get_provider
 from services.providers.base import ProviderNeedsUserAction
 from services.overview import build_project_overview
+from services.review import (
+    approve_final_score, build_review_dashboard, import_manual_totals,
+    load_manual_scores, reopen_final_score, set_manual_score,
+)
 from services.submissions import build_submission_status
 
 
@@ -2394,6 +2398,126 @@ def api_status():
     return jsonify(grading_state)
 
 
+def _review_participant_numbers(config: ProjectConfig) -> list[int]:
+    numbers = {
+        int(participant["number"])
+        for participant in find_materials(config)
+        if participant.get("number")
+    }
+    numbers.update(
+        int(student.number)
+        for student in config.roster_students
+        if int(student.number) > 0
+    )
+    return sorted(numbers)
+
+
+def _review_round_ids(raw_value) -> list[int] | None:
+    if raw_value in (None, ""):
+        return None
+    values = raw_value if isinstance(raw_value, list) else str(raw_value).split(",")
+    try:
+        return sorted({
+            int(value)
+            for value in values
+            if str(value).strip() and int(value) > 0
+        })
+    except (TypeError, ValueError):
+        raise ValueError("검토 회차 번호를 확인하세요.")
+
+
+@app.route("/api/projects/<project_id>/review")
+def api_review_dashboard(project_id):
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    try:
+        dashboard = build_review_dashboard(
+            config,
+            round_ids=_review_round_ids(request.args.get("rounds")),
+            participant_numbers=_review_participant_numbers(config),
+            std_threshold=max(
+                0.0, float(request.args.get("std_threshold", 1.5))
+            ),
+            range_threshold=max(
+                0.0, float(request.args.get("range_threshold", 2.0))
+            ),
+            manual_diff_threshold=max(
+                0.0, float(request.args.get("manual_diff_threshold", 2.0))
+            ),
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(dashboard)
+
+
+@app.route(
+    "/api/projects/<project_id>/review/<int:team_num>/manual",
+    methods=["PUT"],
+)
+def api_save_review_manual(project_id, team_num):
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    payload = request.get_json(silent=True) or {}
+    try:
+        entry = set_manual_score(
+            config,
+            team_num,
+            total_score=payload.get("total_score"),
+            item_scores=payload.get("item_scores") or {},
+            source="direct",
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"success": True, "manual": entry})
+
+
+@app.route(
+    "/api/projects/<project_id>/review/<int:team_num>/approve",
+    methods=["POST"],
+)
+def api_approve_final_score(project_id, team_num):
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    payload = request.get_json(silent=True) or {}
+    try:
+        decision = approve_final_score(
+            config,
+            team_num,
+            final_total_score=payload.get("final_total_score"),
+            item_scores=payload.get("item_scores") or {},
+            teacher_note=str(payload.get("teacher_note", "")),
+            decision_source=str(payload.get("decision_source", "custom")),
+            basis_rounds=_review_round_ids(payload.get("basis_rounds")),
+            participant_numbers=_review_participant_numbers(config),
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"success": True, "decision": decision})
+
+
+@app.route(
+    "/api/projects/<project_id>/review/<int:team_num>/reopen",
+    methods=["POST"],
+)
+def api_reopen_final_score(project_id, team_num):
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    payload = request.get_json(silent=True) or {}
+    try:
+        decision = reopen_final_score(
+            config,
+            team_num,
+            reason=str(payload.get("reason", "")),
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"success": True, "decision": decision})
+
+
 @app.route("/api/projects/<project_id>/regrade-candidates")
 def api_regrade_candidates(project_id):
     """두 회차 이상에서 점수 차이·검토 표시가 있는 학생을 추가 회차 후보로 제안."""
@@ -2551,31 +2675,47 @@ def api_update_result(project_id, team_num):
     if team_num not in completed:
         return jsonify({"error": "기존 결과를 찾을 수 없습니다."}), 404
     
-    # 데이터 업데이트 (팀 번호는 고정)
+    # AI 원본은 최초 교사 수정 전에 별도 보존한다. 화면에 보이는 회차 보정값과
+    # 신뢰도 비교용 원본 AI 점수가 섞이지 않게 하기 위함이다.
     old_data = completed[team_num]
     before = dict(old_data)
+    if not isinstance(old_data.get("ai_original"), dict):
+        immutable_keys = {
+            "audit_log", "teacher_status", "teacher_approved_at",
+            "teacher_note", "ai_original",
+        }
+        old_data["ai_original"] = {
+            key: value
+            for key, value in before.items()
+            if key not in immutable_keys
+        }
     for k, v in new_data.items():
-        if k not in ("team_number", "teacher_status", "teacher_approved_at", "audit_log"):
+        if k not in (
+            "team_number", "teacher_status", "teacher_approved_at",
+            "audit_log", "ai_original", "grading_run",
+        ):
             old_data[k] = v
             
     # 소계/합계 재계산
     updated_data = compute_scores(config, old_data)
-    if config.project_type == "exam":
-        changed = {
-            key: {"before": before.get(key), "after": updated_data.get(key)}
-            for key in new_data
-            if before.get(key) != updated_data.get(key)
-            and key not in ("audit_log", "teacher_status", "teacher_approved_at")
-        }
-        audit_log = list(before.get("audit_log", []))
-        audit_log.append({
-            "timestamp": datetime.now().isoformat(),
-            "action": "manual_edit",
-            "changes": changed,
-        })
-        updated_data["audit_log"] = audit_log
-        updated_data["teacher_status"] = "pending"
-        updated_data.pop("teacher_approved_at", None)
+    changed = {
+        key: {"before": before.get(key), "after": updated_data.get(key)}
+        for key in new_data
+        if before.get(key) != updated_data.get(key)
+        and key not in (
+            "audit_log", "teacher_status", "teacher_approved_at",
+            "ai_original", "grading_run",
+        )
+    }
+    audit_log = list(before.get("audit_log", []))
+    audit_log.append({
+        "timestamp": datetime.now().isoformat(),
+        "action": "round_result_adjusted",
+        "changes": changed,
+    })
+    updated_data["audit_log"] = audit_log
+    updated_data["teacher_status"] = "pending"
+    updated_data.pop("teacher_approved_at", None)
     
     # 저장
     save_result(project_id, round_id, updated_data, team_num)
@@ -2584,7 +2724,7 @@ def api_update_result(project_id, team_num):
 
 @app.route("/api/projects/<project_id>/result/<int:team_num>/approve", methods=["POST"])
 def api_approve_result(project_id, team_num):
-    """교사가 확인한 시험 채점만 확정 상태로 전환."""
+    """기존 호환용: 시험의 개별 회차 판정을 교사 확인 상태로 전환."""
     round_id = request.args.get("round", type=int) or get_latest_round_id(project_id)
     config = load_project(project_id)
     if not config:
@@ -2630,6 +2770,9 @@ def api_delete_result(project_id, team_num):
 @app.route("/api/projects/<project_id>/manual-scores/upload", methods=["POST"])
 def api_upload_manual(project_id):
     """수동 채점 Excel 업로드"""
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
     if 'file' not in request.files:
         return jsonify({"error": "파일이 없습니다."}), 400
     file = request.files['file']
@@ -2661,68 +2804,53 @@ def api_upload_manual(project_id):
                     manual_data[int(t_num)] = float(t_score)
                 except (ValueError, TypeError):
                     pass
-        json_path = PROJECTS_DIR / project_id / "manual_scores.json"
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(manual_data, f, ensure_ascii=False)
-        return jsonify({"count": len(manual_data)})
+        imported = import_manual_totals(config, manual_data, source="excel")
+        return jsonify({
+            "count": len(imported),
+            "skipped": max(0, len(manual_data) - len(imported)),
+        })
     except Exception as e:
         return jsonify({"error": f"파싱 실패: {str(e)[:200]}"}), 500
 
 
 @app.route("/api/projects/<project_id>/manual-scores")
 def api_get_manual(project_id):
-    json_path = PROJECTS_DIR / project_id / "manual_scores.json"
-    if json_path.exists():
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return jsonify({"count": len(data)})
-    return jsonify({"count": 0})
+    if not load_project(project_id):
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    data = load_manual_scores(project_id)
+    return jsonify({
+        "count": len(data),
+        "with_item_scores": sum(
+            1 for value in data.values() if value.get("item_scores")
+        ),
+    })
 
 
 @app.route("/api/projects/<project_id>/analysis")
 def api_analysis(project_id):
-    """다회차 종합 분석"""
-    import statistics
+    """AI 회차 통계와 수동 점수를 서로 섞지 않고 비교한다."""
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
     rounds_param = request.args.get("rounds", "")
     include_manual = request.args.get("include_manual", "false").lower() == "true"
     round_ids = [int(r) for r in rounds_param.split(",") if r.strip().isdigit()]
-    manual_scores = {}
-    json_path = PROJECTS_DIR / project_id / "manual_scores.json"
-    if json_path.exists():
-        with open(json_path, "r", encoding="utf-8") as f:
-            manual_scores = {int(k): v for k, v in json.load(f).items()}
-    team_data = {}
-    for r_id in round_ids:
-        round_dir = get_round_dir(project_id, r_id)
-        if not round_dir.exists():
-            continue
-        for json_file in round_dir.glob("team_*.json"):
-            try:
-                with open(json_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                t_num = data.get("team_number")
-                if t_num is None:
-                    continue
-                if t_num not in team_data:
-                    team_data[t_num] = {"team_number": t_num, "team_name": data.get("team_name", f"참가자 {t_num}"), "scores": {}, "comments": []}
-                team_data[t_num]["scores"][f"{r_id}회"] = data.get("total_score", 0)
-                if data.get("overall_comment"):
-                    team_data[t_num]["comments"].append(data["overall_comment"])
-            except Exception:
-                continue
-    for t_num, score in manual_scores.items():
-        if t_num not in team_data:
-            team_data[t_num] = {"team_number": t_num, "team_name": f"참가자 {t_num}", "scores": {}, "comments": []}
-        team_data[t_num]["manual_score"] = score
+    dashboard = build_review_dashboard(
+        config,
+        round_ids=round_ids,
+        participant_numbers=_review_participant_numbers(config),
+    )
     results = []
-    for t_num, t_info in team_data.items():
-        calc_scores = list(t_info["scores"].values())
-        if include_manual and "manual_score" in t_info:
-            calc_scores.append(t_info["manual_score"])
-        if not calc_scores:
+    for student in dashboard["students"]:
+        scores = {
+            f"{round_id}회": score
+            for round_id, score in student["scores_by_round"].items()
+        }
+        calc_scores = list(scores.values())
+        manual_score = student["manual_score"] if include_manual else None
+        if not calc_scores and manual_score is None:
             continue
-        avg = sum(calc_scores) / len(calc_scores)
-        std_dev = statistics.pstdev(calc_scores) if len(calc_scores) > 1 else 0.0
+        avg = student["ai_average"]
         trimmed_avg = avg
         is_trimmed = False
         if len(calc_scores) >= 5:
@@ -2730,23 +2858,38 @@ def api_analysis(project_id):
             trimmed_avg = sum(trimmed_list) / len(trimmed_list)
             is_trimmed = True
         results.append({
-            "team_number": t_num, "team_name": t_info["team_name"],
-            "manual_score": t_info.get("manual_score"),
-            "scores_by_round": t_info["scores"], "score_count": len(calc_scores),
-            "average": round(avg, 2), "trimmed_average": round(trimmed_avg, 2),
-            "is_trimmed": is_trimmed, "std_dev": round(std_dev, 2),
-            "sample_comment": t_info["comments"][-1] if t_info["comments"] else ""
+            "team_number": student["team_number"],
+            "team_name": student["team_name"],
+            "manual_score": manual_score,
+            "scores_by_round": scores,
+            "score_count": len(calc_scores),
+            "average": round(avg, 2) if avg is not None else None,
+            "median": student["ai_median"],
+            "trimmed_average": (
+                round(trimmed_avg, 2) if trimmed_avg is not None else None
+            ),
+            "is_trimmed": is_trimmed,
+            "std_dev": student["std_dev"],
+            "ai_manual_difference": (
+                student["ai_manual_difference"] if include_manual else None
+            ),
+            "sample_comment": "",
         })
-    results.sort(key=lambda x: x["trimmed_average"] if x["is_trimmed"] else x["average"], reverse=True)
+    results.sort(
+        key=lambda value: (
+            value["average"] is None,
+            -(value["average"] or 0),
+            value["team_number"],
+        )
+    )
     return jsonify(results)
 
 
 @app.route("/api/projects/<project_id>/analysis/excel")
 def api_analysis_excel(project_id):
-    """분석 결과 Excel 다운로드"""
+    """AI·수동·확정 점수 계층을 분리한 분석 결과 Excel 다운로드."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
-    import statistics
     
     config = load_project(project_id)
     if not config:
@@ -2755,51 +2898,47 @@ def api_analysis_excel(project_id):
     rounds_param = request.args.get("rounds", "")
     include_manual = request.args.get("include_manual", "false").lower() == "true"
     round_ids = [int(r) for r in rounds_param.split(",") if r.strip().isdigit()]
-    manual_scores = {}
-    json_path = PROJECTS_DIR / project_id / "manual_scores.json"
-    if json_path.exists():
-        with open(json_path, "r", encoding="utf-8") as f:
-            manual_scores = {int(k): v for k, v in json.load(f).items()}
-    
-    team_data = {}
-    for r_id in round_ids:
-        round_dir = get_round_dir(project_id, r_id)
-        if not round_dir.exists():
-            continue
-        for jf in round_dir.glob("team_*.json"):
-            try:
-                with open(jf, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                t_num = data.get("team_number")
-                if t_num is None: continue
-                if t_num not in team_data:
-                    team_data[t_num] = {"team_number": t_num, "team_name": data.get("team_name", ""), "scores": {}, "comments": [], "seteuk": ""}
-                team_data[t_num]["scores"][f"{r_id}회"] = data.get("total_score", 0)
-                if data.get("overall_comment"):
-                    team_data[t_num]["comments"].append(data["overall_comment"])
-                if data.get("seteuk"):
-                    team_data[t_num]["seteuk"] = data["seteuk"]
-            except Exception: continue
-    for t_num, score in manual_scores.items():
-        if t_num not in team_data:
-            team_data[t_num] = {"team_number": t_num, "team_name": f"참가자 {t_num}", "scores": {}, "comments": [], "seteuk": ""}
-        team_data[t_num]["manual_score"] = score
-    
-    all_round_keys = sorted(set(k for td in team_data.values() for k in td["scores"].keys()))
+    dashboard = build_review_dashboard(
+        config,
+        round_ids=round_ids,
+        participant_numbers=_review_participant_numbers(config),
+    )
+    all_round_keys = [f"{round_id}회" for round_id in dashboard["selected_round_ids"]]
     results = []
-    for t_num, t_info in team_data.items():
-        calc_scores = list(t_info["scores"].values())
-        if include_manual and "manual_score" in t_info:
-            calc_scores.append(t_info["manual_score"])
-        if not calc_scores: continue
-        avg = sum(calc_scores) / len(calc_scores)
-        std_dev = statistics.pstdev(calc_scores) if len(calc_scores) > 1 else 0.0
-        trimmed_avg = avg
+    for student in dashboard["students"]:
+        scores = {
+            f"{round_id}회": score
+            for round_id, score in student["scores_by_round"].items()
+        }
+        calc_scores = list(scores.values())
+        manual = student["manual_score"] if include_manual else None
+        if not calc_scores and manual is None:
+            continue
+        trimmed_average = student["ai_average"]
         if len(calc_scores) >= 5:
             trimmed_list = sorted(calc_scores)[1:-1]
-            trimmed_avg = sum(trimmed_list) / len(trimmed_list)
-        results.append({**t_info, "average": round(avg, 2), "trimmed_average": round(trimmed_avg, 2), "std_dev": round(std_dev, 2)})
-    results.sort(key=lambda x: x["average"], reverse=True)
+            trimmed_average = round(sum(trimmed_list) / len(trimmed_list), 2)
+        latest_result = {}
+        for round_id in reversed(dashboard["selected_round_ids"]):
+            candidate = load_completed(project_id, round_id).get(
+                student["team_number"], {}
+            )
+            if candidate:
+                latest_result = candidate
+                break
+        results.append({
+            **student,
+            "scores": scores,
+            "manual_score": manual,
+            "trimmed_average": trimmed_average,
+            "overall_comment": latest_result.get("overall_comment", ""),
+            "seteuk": latest_result.get("seteuk", ""),
+        })
+    results.sort(key=lambda value: (
+        value["ai_average"] is None,
+        -(value["ai_average"] or 0),
+        value["team_number"],
+    ))
     
     wb = Workbook()
     ws = wb.active
@@ -2809,21 +2948,90 @@ def api_analysis_excel(project_id):
     dfont = Font(name="맑은 고딕", size=10)
     ca = Alignment(horizontal="center", vertical="center")
     bd = Border(left=Side(style="thin"), right=Side(style="thin"), top=Side(style="thin"), bottom=Side(style="thin"))
-    headers = ["순위", "번호", "이름"] + all_round_keys + ["수동채점", "평균", "절사평균", "편차", "차이(AI-수동)", "종합의견", "세특"]
+    headers = (
+        ["순위", "번호", "이름"]
+        + all_round_keys
+        + [
+            "AI 평균", "AI 중앙값", "절사평균", "AI 표준편차",
+            "수동채점", "차이(AI-수동)", "AI 제안점수",
+            "교사 확정점수", "확정 상태", "확정 근거",
+            "검토 사유", "종합의견", "세특",
+        ]
+    )
     for col, h in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col, value=h)
         cell.font = hfont; cell.fill = hfill; cell.alignment = ca; cell.border = bd
     for rank, r in enumerate(results, 1):
         manual = r.get("manual_score")
-        diff = round(r["average"] - manual, 2) if manual is not None else ""
+        decision = r.get("decision") or {}
         vals = [rank, r["team_number"], r["team_name"]]
         for rk in all_round_keys:
             vals.append(r["scores"].get(rk, ""))
-        vals += [manual if manual is not None else "", r["average"], r["trimmed_average"], r["std_dev"], diff, r["comments"][-1] if r.get("comments") else "", r.get("seteuk", "")]
+        vals += [
+            r["ai_average"] if r["ai_average"] is not None else "",
+            r["ai_median"] if r["ai_median"] is not None else "",
+            r["trimmed_average"] if r["trimmed_average"] is not None else "",
+            r["std_dev"],
+            manual if manual is not None else "",
+            r["ai_manual_difference"] if manual is not None else "",
+            r["ai_suggested_score"] if r["ai_suggested_score"] is not None else "",
+            decision.get("total_score", ""),
+            "확정" if decision.get("status") == "approved" else "대기",
+            decision.get("decision_source", ""),
+            " · ".join(reason["label"] for reason in r["review_reasons"]),
+            r.get("overall_comment", ""),
+            r.get("seteuk", ""),
+        ]
         row = rank + 1
         for col, val in enumerate(vals, 1):
             cell = ws.cell(row=row, column=col, value=val)
             cell.font = dfont; cell.alignment = ca; cell.border = bd
+
+    detail_ws = wb.create_sheet("항목별 비교")
+    detail_headers = (
+        ["번호", "이름", "항목·문항", "배점"]
+        + all_round_keys
+        + [
+            "AI 평균", "AI 중앙값", "표준편차",
+            "수동 점수", "차이(AI-수동)", "최종 확정",
+        ]
+    )
+    for col, header in enumerate(detail_headers, 1):
+        cell = detail_ws.cell(row=1, column=col, value=header)
+        cell.font = hfont
+        cell.fill = hfill
+        cell.alignment = ca
+        cell.border = bd
+    detail_row = 2
+    for result in results:
+        for item in result.get("items", []):
+            values = [
+                result["team_number"],
+                result["team_name"],
+                item["label"],
+                item["max_score"],
+            ]
+            for round_key in all_round_keys:
+                round_id = int(round_key[:-1])
+                values.append(item["scores_by_round"].get(round_id, ""))
+            values += [
+                item["ai_average"] if item["ai_average"] is not None else "",
+                item["ai_median"] if item["ai_median"] is not None else "",
+                item["std_dev"],
+                item["manual_score"] if include_manual and item["manual_score"] is not None else "",
+                (
+                    item["ai_manual_difference"]
+                    if include_manual and item["ai_manual_difference"] is not None
+                    else ""
+                ),
+                item["final_score"] if item["final_score"] is not None else "",
+            ]
+            for col, value in enumerate(values, 1):
+                cell = detail_ws.cell(row=detail_row, column=col, value=value)
+                cell.font = dfont
+                cell.alignment = ca
+                cell.border = bd
+            detail_row += 1
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = PROJECTS_DIR / project_id / "results" / f"종합분석_{timestamp}.xlsx"

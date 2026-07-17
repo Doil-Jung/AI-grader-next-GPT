@@ -11,6 +11,8 @@ let pendingCriteriaSource = null;
 let currentGradingRounds = [];
 let currentRegradeCandidates = [];
 let gradingPlanTimer = null;
+let currentReviewDashboard = null;
+let currentReviewStudent = null;
 
 const WORKFLOW_LABELS = {
   report: '보고서·수행평가',
@@ -38,7 +40,11 @@ function showTab(name) {
   const tabs = document.getElementById('mainTabs');
   if (tabs) tabs.style.display = currentProject && name !== 'projects' ? '' : 'none';
   if (name === 'overview') loadOverview();
-  if (name === 'results') { loadRounds('resultRound', () => loadResults()); loadRoundsForAnalysis(); }
+  if (name === 'results') {
+    loadReviewDashboard();
+    loadRounds('resultRound', () => loadResults());
+    loadRoundsForAnalysis();
+  }
   if (name === 'analysis') {
     loadRoundsForAnalysis();
     if (currentProject?.workflow_type === 'competition') loadRounds('subRound', () => loadSubmission());
@@ -338,7 +344,7 @@ function renderOverview(data) {
   roundContainer.innerHTML = rounds.map(round => `
     <div class="round-card">
       <div class="round-title"><strong>${round.id}회차</strong><span class="round-status status-${esc(round.status || 'legacy')}">${roundStatusLabel(round.status)}</span></div>
-      <p>${round.completed_count}/${round.target_count || round.completed_count}명 성공 · 실패 ${round.failure_count || 0}명 · 교사 확정 ${round.approved_count}명 · 검토 표시 ${round.review_required_count}명</p>
+      <p>${round.completed_count}/${round.target_count || round.completed_count}명 성공 · 실패 ${round.failure_count || 0}명 · 회차 확인 ${round.approved_count}명 · 검토 표시 ${round.review_required_count}명</p>
       <p class="round-context-line">${round.model ? `${esc(round.provider)} · ${esc(round.model)} · ${criteriaVersionLabel(round)}` : '기존 회차 · 모델·기준 기록 없음'}</p>
     </div>
   `).join('');
@@ -2158,7 +2164,302 @@ async function updateStats() {
   }
 }
 
-// ═══ 결과 조회 ═══
+// ═══ 교사 통합 검토·최종 확정 ═══
+function reviewScore(value) {
+  if (value === null || value === undefined || value === '') return '-';
+  const number = Number(value);
+  return Number.isFinite(number)
+    ? number.toLocaleString('ko-KR', { maximumFractionDigits: 2 })
+    : '-';
+}
+
+function selectedReviewRounds() {
+  return [...document.querySelectorAll('.review-round-cb:checked')]
+    .map(input => Number(input.value))
+    .filter(Number.isFinite);
+}
+
+async function loadReviewDashboard() {
+  if (!currentProject) return;
+  const roundContainer = document.getElementById('reviewRoundChecks');
+  const body = document.getElementById('reviewBody');
+  if (!roundContainer || !body) return;
+  body.innerHTML = '<tr><td colspan="12" class="review-loading">검토 자료를 계산하는 중입니다.</td></tr>';
+  try {
+    const roundsResponse = await fetch(`/api/projects/${currentProject.id}/rounds`);
+    const rounds = await roundsResponse.json();
+    if (!roundsResponse.ok) throw new Error(rounds.error || '회차를 불러오지 못했습니다.');
+    const previousSelection = new Set(selectedReviewRounds());
+    const resultRounds = rounds.filter(round => round.completed_count > 0);
+    roundContainer.innerHTML = resultRounds.map(round => {
+      const checked = !previousSelection.size || previousSelection.has(round.id);
+      return `<label class="round-check">
+        <input type="checkbox" class="review-round-cb" value="${round.id}" ${checked ? 'checked' : ''}>
+        ${round.id}회차 <small>${round.completed_count}/${round.target_count}명</small>
+      </label>`;
+    }).join('') || '<span class="helper-text">결과가 있는 회차가 없습니다.</span>';
+
+    const params = new URLSearchParams({
+      rounds: selectedReviewRounds().join(','),
+      std_threshold: document.getElementById('reviewStdThreshold')?.value || '1.5',
+      range_threshold: document.getElementById('reviewRangeThreshold')?.value || '2',
+      manual_diff_threshold: document.getElementById('reviewManualDiffThreshold')?.value || '2',
+    });
+    const response = await fetch(`/api/projects/${currentProject.id}/review?${params}`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || '통합 검토 자료를 만들지 못했습니다.');
+    currentReviewDashboard = data;
+    const summary = data.summary || {};
+    document.getElementById('reviewStudentCount').textContent = summary.student_count || 0;
+    document.getElementById('reviewAttentionCount').textContent = summary.attention_count || 0;
+    document.getElementById('reviewManualCount').textContent = summary.manual_count || 0;
+    document.getElementById('reviewApprovedCount').textContent = summary.effective_approved_count ?? summary.approved_count ?? 0;
+    const note = document.getElementById('reviewSelectionNote');
+    note.textContent = data.selected_round_ids.length
+      ? `${data.selected_round_ids.join('·')}회차의 AI 원점수만으로 평균·중앙값·표준편차를 계산합니다. 수동 점수는 평균에 섞지 않고 차이 확인에만 사용합니다.`
+      : '결과 회차가 없습니다. 수동 점수만 저장할 수 있으며 AI 종합 제안은 생성되지 않습니다.';
+    renderReviewDashboard();
+  } catch (error) {
+    body.innerHTML = `<tr><td colspan="12" class="criteria-error">${esc(error.message)}</td></tr>`;
+  }
+}
+
+function renderReviewDashboard() {
+  const body = document.getElementById('reviewBody');
+  if (!body || !currentReviewDashboard) return;
+  const filter = document.getElementById('reviewFilter')?.value || 'all';
+  const students = (currentReviewDashboard.students || []).filter(student => {
+    const approved = student.decision?.status === 'approved';
+    if (filter === 'attention') return student.review_required;
+    if (filter === 'pending') return !approved;
+    if (filter === 'approved') return approved;
+    return true;
+  });
+  if (!students.length) {
+    body.innerHTML = '<tr><td colspan="12" class="review-loading">현재 조건에 해당하는 학생이 없습니다.</td></tr>';
+    return;
+  }
+  body.innerHTML = students.map(student => {
+    const approved = student.decision?.status === 'approved';
+    const priority = ({
+      critical: '<span class="review-priority critical">긴급 확인</span>',
+      attention: '<span class="review-priority attention">우선 확인</span>',
+      normal: '<span class="review-priority normal">일반</span>',
+    })[student.priority] || '';
+    const rounds = currentReviewDashboard.selected_round_ids
+      .map(round => {
+        const raw = reviewScore(student.scores_by_round?.[round]);
+        const adjusted = student.adjusted_scores_by_round?.[round];
+        return `${round}회 ${raw}${adjusted != null ? ` → 보정 ${reviewScore(adjusted)}` : ''}`;
+      })
+      .join('<br>');
+    const difference = student.ai_manual_difference;
+    const differenceClass = difference != null && Math.abs(difference) >= currentReviewDashboard.thresholds.manual_difference
+      ? 'review-difference warning'
+      : 'review-difference';
+    const finalScore = approved ? reviewScore(student.decision.total_score) : '-';
+    const status = approved
+      ? `<span class="badge badge-success">최종 확정</span>${student.decision_stale ? '<br><span class="badge badge-danger">자료 변경됨</span>' : ''}`
+      : '<span class="badge badge-warning">확정 대기</span>';
+    const reasonText = (student.review_reasons || []).map(reason => reason.label).join(' · ');
+    return `<tr class="review-row priority-${student.priority}">
+      <td>${priority}</td>
+      <td>${student.team_number}</td>
+      <td>${esc(student.team_name || '')}</td>
+      <td class="round-score-cell">${rounds || '-'}</td>
+      <td><strong>${reviewScore(student.ai_average)}</strong></td>
+      <td>${reviewScore(student.std_dev)}</td>
+      <td>${reviewScore(student.manual_score)}</td>
+      <td class="${differenceClass}">${difference == null ? '-' : `${difference > 0 ? '+' : ''}${reviewScore(difference)}`}</td>
+      <td>${reviewScore(student.ai_suggested_score)}</td>
+      <td><strong>${finalScore}</strong></td>
+      <td>${status}</td>
+      <td><button class="btn btn-primary btn-sm" onclick="openReviewDecision(${student.team_number})">검토·확정</button>
+      ${reasonText ? `<div class="review-reasons" title="${esc(reasonText)}">${esc(reasonText)}</div>` : ''}</td>
+    </tr>`;
+  }).join('');
+}
+
+function reviewItemInputs(selector) {
+  const values = {};
+  document.querySelectorAll(selector).forEach(input => {
+    if (input.value !== '') values[input.dataset.id] = Number(input.value);
+  });
+  return values;
+}
+
+function updateReviewTotalsFromItems(kind) {
+  const selector = kind === 'manual' ? '.review-manual-item' : '.review-final-item';
+  const target = document.getElementById(kind === 'manual' ? 'reviewManualTotal' : 'reviewFinalTotal');
+  const inputs = [...document.querySelectorAll(selector)].filter(input => input.value !== '');
+  if (!target || !inputs.length) return;
+  const total = inputs.reduce((sum, input) => sum + (Number(input.value) || 0), 0);
+  target.value = Number(total.toFixed(2));
+  if (kind === 'final') document.getElementById('reviewDecisionSource').value = 'custom';
+}
+
+function renderReviewAudit(student) {
+  const element = document.getElementById('reviewDecisionAudit');
+  const entries = student.audit_log || [];
+  if (!entries.length) {
+    element.innerHTML = '<span>아직 교사 변경 이력이 없습니다.</span>';
+    return;
+  }
+  const labels = {
+    manual_score_saved: '수동 점수 저장',
+    manual_score_imported: '수동 점수 Excel 가져오기',
+    final_score_approved: '최종 점수 확정',
+    final_score_reopened: '확정 취소·재검토',
+  };
+  element.innerHTML = `<details><summary>교사 변경 이력 ${entries.length}건</summary>
+    ${[...entries].reverse().slice(0, 10).map(entry => `
+      <div class="review-audit-entry">
+        <strong>${esc(labels[entry.action] || entry.action)}</strong>
+        <span>${esc(formatDateTime(entry.timestamp))}</span>
+      </div>`).join('')}
+  </details>`;
+}
+
+function openReviewDecision(teamNumber) {
+  if (!currentReviewDashboard) return;
+  const student = currentReviewDashboard.students.find(
+    value => value.team_number === Number(teamNumber)
+  );
+  if (!student) return;
+  currentReviewStudent = student;
+  const decision = student.decision || {};
+  const approved = decision.status === 'approved';
+  document.getElementById('reviewDecisionTitle').textContent = `${student.team_number}번 ${student.team_name || ''}`;
+  document.getElementById('reviewDecisionSummary').innerHTML = `
+    <div class="review-summary-strip">
+      <span>AI 평균 <strong>${reviewScore(student.ai_average)}</strong></span>
+      <span>AI 중앙값 <strong>${reviewScore(student.ai_median)}</strong></span>
+      <span>표준편차 <strong>${reviewScore(student.std_dev)}</strong></span>
+      <span>수동 <strong>${reviewScore(student.manual_score)}</strong></span>
+      <span>AI-수동 <strong>${student.ai_manual_difference == null ? '-' : `${student.ai_manual_difference > 0 ? '+' : ''}${reviewScore(student.ai_manual_difference)}`}</strong></span>
+    </div>
+    ${(student.review_reasons || []).length
+      ? `<div class="review-modal-reasons">${student.review_reasons.map(reason => `<span>${esc(reason.label)}</span>`).join('')}</div>`
+      : '<div class="criteria-ok">현재 임계값을 넘는 특별한 확인 사유는 없습니다.</div>'}
+    ${student.decision_stale ? '<div class="criteria-error">확정 이후 회차 또는 수동 점수가 바뀌었습니다. 재검토 후 다시 확정하세요.</div>' : ''}`;
+  document.getElementById('reviewDecisionItems').innerHTML = (student.items || []).map(item => {
+    const roundScores = currentReviewDashboard.selected_round_ids
+      .map(round => `${round}회 ${reviewScore(item.scores_by_round?.[round])}`)
+      .join('<br>');
+    const finalValue = decision.item_scores?.[item.id] ?? item.suggested_score ?? '';
+    return `<tr>
+      <td><strong>${esc(item.label)}</strong><br><small>${esc(item.name || '')}</small></td>
+      <td class="round-score-cell">${roundScores || '-'}</td>
+      <td>${reviewScore(item.ai_average)}</td>
+      <td>${reviewScore(item.std_dev)}</td>
+      <td><input type="number" class="review-score-input review-manual-item" data-id="${esc(item.id)}" min="0" max="${item.max_score}" step="0.1" value="${item.manual_score ?? ''}" onchange="updateReviewTotalsFromItems('manual')"></td>
+      <td><input type="number" class="review-score-input review-final-item" data-id="${esc(item.id)}" min="0" max="${item.max_score}" step="0.1" value="${finalValue}" onchange="updateReviewTotalsFromItems('final')"></td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="6">평가 항목 정보가 없습니다. 총점만 확정할 수 있습니다.</td></tr>';
+  document.getElementById('reviewManualTotal').value = student.manual_score ?? '';
+  document.getElementById('reviewManualTotal').max = currentReviewDashboard.max_score;
+  document.getElementById('reviewFinalTotal').value = decision.total_score ?? student.ai_suggested_score ?? '';
+  document.getElementById('reviewFinalTotal').max = currentReviewDashboard.max_score;
+  document.getElementById('reviewDecisionSource').value = decision.decision_source || 'ai_suggested';
+  document.getElementById('reviewTeacherNote').value = decision.teacher_note || '';
+  document.getElementById('reviewReopenButton').style.display = approved ? '' : 'none';
+  document.getElementById('reviewApproveButton').textContent = approved ? '다시 승인·확정' : '교사 승인·최종 확정';
+  renderReviewAudit(student);
+  openModal('reviewDecisionModal');
+}
+
+function applyReviewDecisionSource() {
+  if (!currentReviewStudent) return;
+  const source = document.getElementById('reviewDecisionSource').value;
+  if (source === 'ai_suggested') {
+    document.getElementById('reviewFinalTotal').value = currentReviewStudent.ai_suggested_score ?? '';
+    document.querySelectorAll('.review-final-item').forEach(input => {
+      const item = currentReviewStudent.items.find(value => value.id === input.dataset.id);
+      input.value = item?.suggested_score ?? '';
+    });
+  } else if (source === 'manual') {
+    if (currentReviewStudent.manual_score == null) {
+      alert('먼저 수동 점수를 입력하고 저장하세요.');
+      document.getElementById('reviewDecisionSource').value = 'custom';
+      return;
+    }
+    document.getElementById('reviewFinalTotal').value = currentReviewStudent.manual_score;
+    document.querySelectorAll('.review-final-item').forEach(input => {
+      const item = currentReviewStudent.items.find(value => value.id === input.dataset.id);
+      input.value = item?.manual_score ?? '';
+    });
+  }
+}
+
+async function saveReviewManualScore() {
+  if (!currentProject || !currentReviewStudent) return;
+  const totalValue = document.getElementById('reviewManualTotal').value;
+  const response = await fetch(
+    `/api/projects/${currentProject.id}/review/${currentReviewStudent.team_number}/manual`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        total_score: totalValue === '' ? null : Number(totalValue),
+        item_scores: reviewItemInputs('.review-manual-item'),
+      }),
+    }
+  );
+  const data = await response.json();
+  if (!response.ok) return alert(data.error || '수동 점수 저장 실패');
+  const teamNumber = currentReviewStudent.team_number;
+  await loadReviewDashboard();
+  openReviewDecision(teamNumber);
+}
+
+async function approveReviewDecision() {
+  if (!currentProject || !currentReviewStudent) return;
+  const totalValue = document.getElementById('reviewFinalTotal').value;
+  if (totalValue === '') return alert('최종 확정 총점을 입력하세요.');
+  if (!confirm('AI 원점수와 수동 점수는 그대로 보존하고, 현재 값을 교사 최종 점수로 확정할까요?')) return;
+  const response = await fetch(
+    `/api/projects/${currentProject.id}/review/${currentReviewStudent.team_number}/approve`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        final_total_score: Number(totalValue),
+        item_scores: reviewItemInputs('.review-final-item'),
+        teacher_note: document.getElementById('reviewTeacherNote').value,
+        decision_source: document.getElementById('reviewDecisionSource').value,
+        basis_rounds: currentReviewDashboard.selected_round_ids,
+      }),
+    }
+  );
+  const data = await response.json();
+  if (!response.ok) return alert(data.error || '최종 점수 확정 실패');
+  const teamNumber = currentReviewStudent.team_number;
+  await loadReviewDashboard();
+  await loadOverview();
+  openReviewDecision(teamNumber);
+}
+
+async function reopenReviewDecision() {
+  if (!currentProject || !currentReviewStudent) return;
+  const reason = prompt('확정을 취소하고 재검토하는 이유를 입력하세요. (선택)', '');
+  if (reason === null) return;
+  const response = await fetch(
+    `/api/projects/${currentProject.id}/review/${currentReviewStudent.team_number}/reopen`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason }),
+    }
+  );
+  const data = await response.json();
+  if (!response.ok) return alert(data.error || '재검토 전환 실패');
+  const teamNumber = currentReviewStudent.team_number;
+  await loadReviewDashboard();
+  await loadOverview();
+  openReviewDecision(teamNumber);
+}
+
+// ═══ 개별 회차 결과 조회 ═══
 async function loadRounds(selectId, cb) {
   if (!currentProject) return;
   const res = await fetch(`/api/projects/${currentProject.id}/rounds`);
@@ -2224,8 +2525,8 @@ function renderResultsTable() {
   tbody.innerHTML = sorted.map((r) => {
     const rank = rankMap.get(r.team_number);
     const approval = r.teacher_status === 'approved'
-      ? '<span class="badge badge-success">승인됨</span>'
-      : `<span class="badge badge-warning">검토 대기${r.review_required_count ? ` ${r.review_required_count}건` : ''}</span>`;
+      ? '<span class="badge badge-success">회차 확인</span>'
+      : `<span class="badge badge-warning">회차 미확인${r.review_required_count ? ` ${r.review_required_count}건` : ''}</span>`;
     return `<tr class="clickable" onclick="showDetail(${r.team_number}, ${round})">
       <td>${rank}</td><td>${r.team_number}</td><td>${esc(r.team_name || '')}</td>
       <td><strong>${r.total_score ?? '-'}</strong></td>
@@ -2281,11 +2582,11 @@ function renderDetail(isEdit = false) {
   let titleHtml = `[${teamNum}번] ${esc(data.team_name || '')}`;
   const isExam = currentProject?.project_type === 'exam';
   const approveButton = isExam && data.teacher_status !== 'approved'
-    ? `<button class="btn btn-success btn-sm" onclick="approveExamResult(${teamNum}, ${round})">✅ 최종 승인</button>` : '';
+    ? `<button class="btn btn-success btn-sm" onclick="approveExamResult(${teamNum}, ${round})">✅ 이 회차 확인 완료</button>` : '';
   const headerAction = isEdit 
     ? `<button class="btn btn-success btn-sm" onclick="saveManualEdit(${teamNum}, ${round})">💾 저장</button>
        <button class="btn btn-secondary btn-sm" onclick="renderDetail(false)">취소</button>`
-    : `<button class="btn btn-primary btn-sm" onclick="renderDetail(true)">✏️ 수정</button>${approveButton}`;
+    : `<button class="btn btn-primary btn-sm" onclick="renderDetail(true)">✏️ 회차 판정 보정</button>${approveButton}`;
   
   document.getElementById('detailTitle').innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;width:100%;padding-right:30px">
     <span>${titleHtml}</span>
@@ -2353,7 +2654,7 @@ function renderDetail(isEdit = false) {
   
   html += `<div style="text-align:right;margin-top:12px;font-size:1.1rem"><strong>총점: ${data.total_score ?? '-'}</strong></div>`;
   if (isExam) {
-    const statusLabel = data.teacher_status === 'approved' ? `✅ 교사 승인 완료 (${esc(data.teacher_approved_at || '')})` : '⚠️ 교사 승인 전 임시 점수';
+    const statusLabel = data.teacher_status === 'approved' ? `✅ 이 회차 교사 확인 완료 (${esc(data.teacher_approved_at || '')})` : '⚠️ 회차 확인 전 AI 점수';
     html += `<div class="card" style="margin-top:12px;background:var(--surface2)"><strong>${statusLabel}</strong>${data.teacher_note ? `<p>${esc(data.teacher_note)}</p>` : ''}</div>`;
   }
   
@@ -2396,16 +2697,17 @@ async function saveManualEdit(teamNum, round) {
   if (res.ok) {
     currentDetailData = result.data;
     renderDetail(false);
-    loadResults(); 
+    loadResults();
+    loadReviewDashboard();
   } else {
     alert('저장 실패: ' + result.error);
   }
 }
 
 async function approveExamResult(teamNum, round) {
-  const note = prompt('승인 메모가 있으면 입력하세요. (선택)', currentDetailData.teacher_note || '');
+  const note = prompt('이 회차 확인 메모가 있으면 입력하세요. (선택)', currentDetailData.teacher_note || '');
   if (note === null) return;
-  if (!confirm('현재 점수를 최종 확정하시겠습니까?')) return;
+  if (!confirm('현재 회차의 판정을 확인 완료로 표시할까요?\n최종 점수 확정은 통합 검토 화면에서 별도로 진행합니다.')) return;
   const res = await fetch(`/api/projects/${currentProject.id}/result/${teamNum}/approve?round=${round}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ teacher_note: note })
   });
@@ -2414,6 +2716,7 @@ async function approveExamResult(teamNum, round) {
   currentDetailData = data.data;
   renderDetail(false);
   loadResults();
+  loadReviewDashboard();
 }
 
 async function downloadResults() {
@@ -2469,6 +2772,7 @@ async function uploadManualScores(input) {
     if (res.ok) {
       st.textContent = `✅ ${data.count}팀 수동채점 로드됨`;
       st.style.color = 'var(--success)';
+      loadReviewDashboard();
     } else {
       st.textContent = `❌ ${data.error}`;
       st.style.color = 'var(--danger)';
@@ -2509,10 +2813,10 @@ async function runAnalysis() {
     let html = `<tr><td>${i + 1}</td><td>${r.team_number}</td><td>${esc(r.team_name || '')}</td>`;
     roundIds.forEach(rid => html += `<td>${r.scores_by_round?.[rid] ?? '-'}</td>`);
     const manual = r.manual_score != null ? r.manual_score : '-';
-    const diff = r.manual_score != null ? (r.average - r.manual_score).toFixed(1) : '-';
-    html += `<td>${manual}</td><td><strong>${r.average}</strong></td>`;
-    html += `<td>${r.is_trimmed ? r.trimmed_average : '-'}</td>`;
-    html += `<td>${r.std_dev}</td><td>${diff}</td></tr>`;
+    const diff = r.ai_manual_difference != null ? Number(r.ai_manual_difference).toFixed(1) : '-';
+    html += `<td>${manual}</td><td><strong>${reviewScore(r.average)}</strong></td>`;
+    html += `<td>${r.is_trimmed ? reviewScore(r.trimmed_average) : '-'}</td>`;
+    html += `<td>${reviewScore(r.std_dev)}</td><td>${diff}</td></tr>`;
     return html;
   }).join('');
 }

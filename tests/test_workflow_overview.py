@@ -143,6 +143,23 @@ def test_overview_recommends_the_next_incomplete_stage(tmp_path, monkeypatch):
     )
     finished = client.get(f"/api/projects/{project_id}/overview").get_json()
     assert finished["grading"]["completed_full_round_count"] == 2
+    assert finished["review"]["approved_count"] == 0
+    assert finished["next_action"]["stage"] == "review"
+
+    for team_number, final_score in ((1, 4), (2, 5)):
+        approved = client.post(
+            f"/api/projects/{project_id}/review/{team_number}/approve",
+            json={
+                "final_total_score": final_score,
+                "item_scores": {},
+                "decision_source": "ai_suggested",
+                "basis_rounds": [1, 2],
+            },
+        )
+        assert approved.status_code == 200
+
+    finished = client.get(f"/api/projects/{project_id}/overview").get_json()
+    assert finished["review"]["approved_count"] == 2
     assert finished["next_action"]["stage"] == "analysis"
 
 
