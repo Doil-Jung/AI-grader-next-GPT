@@ -2,18 +2,62 @@
 let currentProject = null;
 let eventSource = null;
 let submissionData = [];
+let currentOverview = null;
+let wizardStep = 1;
+
+const WORKFLOW_LABELS = {
+  report: '보고서·수행평가',
+  competition: '대회·탐구 심사',
+  exam: '정기고사 서술형',
+};
+const TAB_TO_STAGE = {
+  overview: 'overview',
+  settings: 'criteria',
+  exam: 'criteria',
+  materials: 'submissions',
+  grading: 'grading',
+  results: 'review',
+  analysis: 'analysis',
+};
 
 // ═══ 탭 전환 ═══
 function showTab(name) {
   document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('[data-stage]').forEach(t => t.classList.remove('active'));
   const el = document.getElementById('tab-' + name);
   if (el) el.classList.add('active');
-  document.querySelectorAll(`.tab[data-tab="${name}"]`).forEach(t => t.classList.add('active'));
+  const stage = TAB_TO_STAGE[name];
+  if (stage) document.querySelectorAll(`[data-stage="${stage}"]`).forEach(t => t.classList.add('active'));
+  const tabs = document.getElementById('mainTabs');
+  if (tabs) tabs.style.display = currentProject && name !== 'projects' ? '' : 'none';
+  if (name === 'overview') loadOverview();
   if (name === 'results') { loadRounds('resultRound', () => loadResults()); loadRoundsForAnalysis(); }
-  if (name === 'submission') loadRounds('subRound', () => loadSubmission());
+  if (name === 'analysis') {
+    loadRoundsForAnalysis();
+    if (currentProject?.workflow_type === 'competition') loadRounds('subRound', () => loadSubmission());
+  }
   if (name === 'materials') scanMaterials();
-  if (name === 'grading') renderGradingGrid();
+  if (name === 'grading') {
+    renderGradingGrid();
+    updateGradingRoundContext();
+  }
+}
+
+function showWorkspaceStage(stage) {
+  if (!currentProject) {
+    showTab('projects');
+    return;
+  }
+  const tab = stage === 'criteria'
+    ? (currentProject.project_type === 'exam' ? 'exam' : 'settings')
+    : ({
+        overview: 'overview',
+        submissions: 'materials',
+        grading: 'grading',
+        review: 'results',
+        analysis: 'analysis',
+      }[stage] || 'overview');
+  showTab(tab);
 }
 
 // ═══ 모달 ═══
@@ -31,13 +75,14 @@ async function loadProjects() {
   }
   el.innerHTML = list.map(p => `
     <div class="project-card ${currentProject?.id === p.id ? 'active' : ''}" onclick="selectProject('${p.id}')">
+      <span class="workflow-badge">${esc(WORKFLOW_LABELS[p.workflow_type] || (p.project_type === 'exam' ? WORKFLOW_LABELS.exam : WORKFLOW_LABELS.report))}</span>
       <h3>${esc(p.name)}</h3>
       <div class="meta">
         <span>📏 ${p.criteria_count}개 항목</span>
         <span>📊 ${p.round_count}회차</span>
         <span>👥 ${p.team_count}${p.project_type === 'exam' ? '명' : '팀'}</span>
       </div>
-      <div class="meta" style="margin-top:4px"><span>${p.project_type === 'exam' ? '📝 서술형 시험' : '📄 보고서 평가'}</span><span>🤖 ${esc(p.ai_provider || 'gemini_api')}</span></div>
+      <div class="meta" style="margin-top:4px"><span>🤖 ${esc(p.ai_provider || 'gemini_api')}</span><span>${p.updated_at ? `최근 수정 ${formatDateTime(p.updated_at)}` : ''}</span></div>
       <div style="margin-top:8px;text-align:right">
         <button class="btn btn-danger btn-sm" onclick="event.stopPropagation();deleteProject('${p.id}')">삭제</button>
       </div>
@@ -47,31 +92,252 @@ async function loadProjects() {
 
 async function selectProject(id, skipTabSwitch) {
   const res = await fetch(`/api/projects/${id}`);
+  if (!res.ok) throw new Error('프로젝트를 불러오지 못했습니다.');
   currentProject = await res.json();
-  document.getElementById('headerProject').textContent = currentProject.name;
+  currentProject.workflow_type = currentProject.workflow_type || (currentProject.project_type === 'exam' ? 'exam' : 'report');
+  updateAppShell();
   localStorage.setItem('lastProjectId', id);
   await populateSettings();
-  if (!skipTabSwitch) showTab('settings');
+  if (!skipTabSwitch) showWorkspaceStage('overview');
   loadProjects();
 }
 
-function openNewProjectModal() { openModal('newProjectModal'); document.getElementById('newProjName').value = ''; document.getElementById('newProjDesc').value = ''; }
+function updateAppShell() {
+  const header = document.getElementById('headerProject');
+  const meta = document.getElementById('headerMeta');
+  const settingsButton = document.getElementById('projectSettingsButton');
+  const tabs = document.getElementById('mainTabs');
+  if (!currentProject) {
+    header.textContent = '프로젝트를 선택하세요';
+    meta.style.display = 'none';
+    settingsButton.style.display = 'none';
+    tabs.style.display = 'none';
+    return;
+  }
+  const label = WORKFLOW_LABELS[currentProject.workflow_type] || WORKFLOW_LABELS.report;
+  header.textContent = currentProject.name;
+  meta.innerHTML = `<span>${esc(label)}</span><span class="dot"></span><span>${currentProject.total_max_score || 100}점</span>`;
+  meta.style.display = '';
+  settingsButton.style.display = '';
+  tabs.style.display = '';
+}
+
+function openNewProjectModal() {
+  wizardStep = 1;
+  document.getElementById('newProjName').value = '';
+  document.getElementById('newProjTarget').value = '';
+  document.getElementById('newProjAssessment').value = '';
+  document.getElementById('newProjTotalScore').value = '100';
+  document.getElementById('newProjParticipantMode').value = 'individual';
+  document.getElementById('newProjExpectedCount').value = '0';
+  document.getElementById('newProjDesc').value = '';
+  document.querySelector('input[name="newAISetupMode"][value="recommended"]').checked = true;
+  selectWorkflowType('report');
+  updateWizardAISettings();
+  renderWizardStep();
+  openModal('newProjectModal');
+}
+
+function selectWorkflowType(type) {
+  if (!WORKFLOW_LABELS[type]) return;
+  document.getElementById('newProjType').value = type;
+  document.querySelectorAll('[data-workflow-type]').forEach(button => {
+    button.classList.toggle('selected', button.dataset.workflowType === type);
+  });
+  renderWizardMaterialOptions();
+}
+
+function renderWizardMaterialOptions() {
+  const type = document.getElementById('newProjType')?.value || 'report';
+  const options = type === 'exam'
+    ? [
+        ['official_rubric', '공식 채점기준표 있음', '문제·정답·채점기준표를 등록하여 엄격하게 적용'],
+        ['questions_answers', '문제와 정답 있음', '모범답안과 부분점 기준 초안을 AI가 생성'],
+        ['questions_only', '문제만 있음', '모범답안과 채점기준을 함께 생성'],
+        ['answers_focused', '정답 자료 중심', '답안지에 실제 작성된 문항을 중심으로 준비'],
+        ['pregrade_first', '먼저 답안을 보고 기준화', '자율 선채점 후 실제 답안 유형으로 기준 보정'],
+      ]
+    : [
+        ['rubric_ready', '루브릭 있음', '기존 평가표나 루브릭을 등록하여 사용'],
+        ['generate_rubric', '간단한 설명으로 생성', '평가 목적을 입력해 루브릭 초안을 생성'],
+        ['later', '나중에 준비', '프로젝트를 만든 뒤 평가기준 단계에서 선택'],
+      ];
+  const el = document.getElementById('newProjMaterialOptions');
+  if (!el) return;
+  el.innerHTML = options.map((option, index) => `
+    <label class="option-card">
+      <input type="radio" name="newMaterialStatus" value="${option[0]}" ${index === 0 ? 'checked' : ''}>
+      <span><strong>${option[1]}</strong><small>${option[2]}</small></span>
+    </label>
+  `).join('');
+}
+
+function renderWizardStep() {
+  document.querySelectorAll('[data-wizard-step]').forEach(panel => {
+    panel.classList.toggle('active', Number(panel.dataset.wizardStep) === wizardStep);
+  });
+  document.querySelectorAll('[data-wizard-indicator]').forEach(indicator => {
+    indicator.classList.toggle('active', Number(indicator.dataset.wizardIndicator) === wizardStep);
+  });
+  document.getElementById('wizardBackButton').style.visibility = wizardStep === 1 ? 'hidden' : 'visible';
+  document.getElementById('wizardNextButton').style.display = wizardStep === 4 ? 'none' : '';
+  document.getElementById('wizardCreateButton').style.display = wizardStep === 4 ? '' : 'none';
+  document.getElementById('wizardValidation').textContent = '';
+}
+
+function changeWizardStep(delta) {
+  if (delta > 0 && wizardStep === 2 && !document.getElementById('newProjName').value.trim()) {
+    document.getElementById('wizardValidation').textContent = '프로젝트 이름을 입력하세요.';
+    document.getElementById('newProjName').focus();
+    return;
+  }
+  wizardStep = Math.max(1, Math.min(4, wizardStep + delta));
+  renderWizardStep();
+}
+
+function updateWizardAISettings() {
+  const mode = document.querySelector('input[name="newAISetupMode"]:checked')?.value || 'recommended';
+  document.getElementById('wizardAdvancedAI').style.display = mode === 'advanced' ? '' : 'none';
+}
+
+async function populateWizardProviders() {
+  const res = await fetch('/api/providers');
+  const providers = await res.json();
+  const select = document.getElementById('newProjProvider');
+  select.innerHTML = providers.filter(p => !p.disabled).map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');
+  await updateWizardModels();
+}
+
+async function updateWizardModels() {
+  const provider = document.getElementById('newProjProvider')?.value || 'openai_api';
+  const res = await fetch(`/api/models?provider=${encodeURIComponent(provider)}`);
+  const models = await res.json();
+  document.getElementById('newProjModel').innerHTML = Object.entries(models)
+    .map(([id, model]) => `<option value="${id}">${esc(model.name)}</option>`).join('');
+}
 
 async function createProject() {
   const name = document.getElementById('newProjName').value.trim();
-  if (!name) return alert('이름을 입력하세요');
-  const res = await fetch('/api/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, description: document.getElementById('newProjDesc').value, project_type: document.getElementById('newProjType').value }) });
+  if (!name) {
+    wizardStep = 2;
+    renderWizardStep();
+    document.getElementById('wizardValidation').textContent = '프로젝트 이름을 입력하세요.';
+    return;
+  }
+  const workflowType = document.getElementById('newProjType').value;
+  const aiSetupMode = document.querySelector('input[name="newAISetupMode"]:checked')?.value || 'recommended';
+  const body = {
+    name,
+    description: document.getElementById('newProjDesc').value.trim(),
+    workflow_type: workflowType,
+    project_type: workflowType === 'exam' ? 'exam' : 'report',
+    total_max_score: Math.max(1, parseInt(document.getElementById('newProjTotalScore').value) || 100),
+    setup: {
+      target: document.getElementById('newProjTarget').value.trim(),
+      assessment_name: document.getElementById('newProjAssessment').value.trim(),
+      participant_mode: document.getElementById('newProjParticipantMode').value,
+      expected_count: Math.max(0, parseInt(document.getElementById('newProjExpectedCount').value) || 0),
+      materials_status: document.querySelector('input[name="newMaterialStatus"]:checked')?.value || 'later',
+      ai_setup_mode: aiSetupMode,
+    },
+  };
+  if (aiSetupMode === 'advanced') {
+    body.ai_provider = document.getElementById('newProjProvider').value;
+    body.ai_model = document.getElementById('newProjModel').value;
+  }
+  const createButton = document.getElementById('wizardCreateButton');
+  createButton.disabled = true;
+  createButton.textContent = '만드는 중...';
+  const res = await fetch('/api/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   const data = await res.json();
+  createButton.disabled = false;
+  createButton.textContent = '프로젝트 만들기';
+  if (!res.ok) {
+    document.getElementById('wizardValidation').textContent = data.error || '프로젝트를 만들지 못했습니다.';
+    return;
+  }
   closeModal('newProjectModal');
-  await selectProject(data.id);
+  await selectProject(data.id, true);
+  showWorkspaceStage('overview');
   loadProjects();
 }
 
 async function deleteProject(id) {
   if (!confirm('정말 삭제하시겠습니까?')) return;
   await fetch(`/api/projects/${id}`, { method: 'DELETE' });
-  if (currentProject?.id === id) { currentProject = null; document.getElementById('headerProject').textContent = '프로젝트를 선택하세요'; }
+  if (currentProject?.id === id) {
+    currentProject = null;
+    currentOverview = null;
+    localStorage.removeItem('lastProjectId');
+    updateAppShell();
+    showTab('projects');
+  }
   loadProjects();
+}
+
+// ═══ 프로젝트 개요 ═══
+async function loadOverview() {
+  if (!currentProject) return;
+  const statusIds = [
+    'overviewCriteriaStatus',
+    'overviewSubmissionStatus',
+    'overviewGradingStatus',
+    'overviewReviewStatus',
+  ];
+  statusIds.forEach(id => {
+    const element = document.getElementById(id);
+    if (element) element.textContent = '확인 중';
+  });
+  try {
+    const res = await fetch(`/api/projects/${currentProject.id}/overview`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '개요를 불러오지 못했습니다.');
+    currentOverview = data;
+    renderOverview(data);
+  } catch (error) {
+    document.getElementById('overviewNextReason').textContent = error.message;
+    document.getElementById('overviewNextButton').textContent = '다시 시도';
+  }
+}
+
+function renderOverview(data) {
+  const project = data.project || {};
+  document.getElementById('overviewWorkflow').textContent = project.workflow_label || '프로젝트';
+  document.getElementById('overviewProjectName').textContent = project.name || currentProject.name;
+  document.getElementById('overviewDescription').textContent = [
+    project.target,
+    project.assessment_name,
+    project.description,
+  ].filter(Boolean).join(' · ') || '준비 상태와 다음 작업을 확인합니다.';
+  document.getElementById('overviewProgress').style.width = `${data.progress_percent || 0}%`;
+  document.getElementById('overviewProgressText').textContent = `${data.progress_percent || 0}% 준비`;
+  document.getElementById('overviewCriteriaStatus').textContent = data.criteria?.label || '확인 필요';
+  document.getElementById('overviewSubmissionStatus').textContent = data.submissions?.label || '확인 필요';
+  document.getElementById('overviewGradingStatus').textContent = data.grading?.label || '확인 필요';
+  document.getElementById('overviewReviewStatus').textContent = data.review?.label || '확인 필요';
+  document.getElementById('overviewNextReason').textContent = data.next_action?.reason || '다음 작업을 선택하세요.';
+  document.getElementById('overviewNextButton').textContent = data.next_action?.label || '계속하기';
+
+  const rounds = data.rounds || [];
+  const roundContainer = document.getElementById('overviewRounds');
+  if (!rounds.length) {
+    roundContainer.innerHTML = '<div class="empty-state"><p>아직 실행한 채점 회차가 없습니다. 첫 회차를 실행하면 학생별 완료 상태가 여기에 표시됩니다.</p></div>';
+    return;
+  }
+  roundContainer.innerHTML = rounds.map(round => `
+    <div class="round-card">
+      <div class="round-title"><strong>${round.id}회차</strong><span class="badge badge-primary">${round.completed_count}명 완료</span></div>
+      <p>교사 확정 ${round.approved_count}명 · 검토 표시 ${round.review_required_count}명 · 승인 대기 ${round.pending_count}명</p>
+    </div>
+  `).join('');
+}
+
+function goToNextAction() {
+  if (!currentOverview) {
+    loadOverview();
+    return;
+  }
+  showWorkspaceStage(currentOverview.next_action?.stage || 'overview');
 }
 
 // ═══ 설정 ═══
@@ -97,7 +363,7 @@ async function populateSettings() {
   if (!currentProject) return;
   document.getElementById('cfgName').value = currentProject.name || '';
   document.getElementById('cfgDesc').value = currentProject.description || '';
-  document.getElementById('cfgProjectType').value = currentProject.project_type || 'report';
+  document.getElementById('cfgProjectType').value = currentProject.workflow_type || (currentProject.project_type === 'exam' ? 'exam' : 'report');
   document.getElementById('cfgProvider').value = currentProject.ai_provider || 'gemini_api';
   document.getElementById('cfgTemp').value = currentProject.temperature ?? 0.2;
   document.getElementById('cfgPrompt').value = currentProject.prompt_template || '';
@@ -115,23 +381,26 @@ async function populateSettings() {
 }
 
 function changeProjectType(value) {
-  if (!currentProject || !['report', 'exam'].includes(value)) return;
-  if (currentProject.project_type !== value) {
-    currentProject.project_type = value;
+  if (!currentProject || !['report', 'competition', 'exam'].includes(value)) return;
+  const nextProjectType = value === 'exam' ? 'exam' : 'report';
+  if (currentProject.project_type !== nextProjectType) {
+    currentProject.project_type = nextProjectType;
     currentProject.prompt_template = '';
     document.getElementById('cfgPrompt').value = '';
   }
+  currentProject.workflow_type = value;
   updateProjectModeUI();
 }
 
 function updateProjectModeUI() {
   const isExam = currentProject?.project_type === 'exam';
-  document.getElementById('examTabButton').style.display = isExam ? '' : 'none';
-  document.getElementById('submissionTabButton').style.display = isExam ? 'none' : '';
   document.getElementById('reportRubricCard').style.display = isExam ? 'none' : '';
   document.getElementById('reportPromptCard').style.display = isExam ? 'none' : '';
   document.getElementById('examIntegratedMaterialsCard').style.display = isExam ? '' : 'none';
   document.getElementById('thApproval').style.display = isExam ? '' : 'none';
+  const rankingCard = document.getElementById('competitionRankingCard');
+  if (rankingCard) rankingCard.style.display = currentProject?.workflow_type === 'competition' ? '' : 'none';
+  updateAppShell();
 }
 
 async function updateProviderUI() {
@@ -198,7 +467,8 @@ async function saveSettings() {
   if (!currentProject) return alert('프로젝트를 먼저 선택하세요');
   currentProject.name = document.getElementById('cfgName').value;
   currentProject.description = document.getElementById('cfgDesc').value;
-  currentProject.project_type = document.getElementById('cfgProjectType').value;
+  currentProject.workflow_type = document.getElementById('cfgProjectType').value;
+  currentProject.project_type = currentProject.workflow_type === 'exam' ? 'exam' : 'report';
   currentProject.ai_model = document.getElementById('cfgModel').value;
   currentProject.ai_provider = document.getElementById('cfgProvider').value;
   currentProject.temperature = parseFloat(document.getElementById('cfgTemp').value);
@@ -213,6 +483,7 @@ async function saveSettings() {
   if (!res.ok) { const err = await res.json(); return alert(err.error || '저장 실패'); }
   currentProject = await res.json();
   await populateSettings();
+  updateAppShell();
   alert('설정이 저장되었습니다');
   loadProjects();
 }
@@ -859,10 +1130,11 @@ async function scanMaterials() {
   const data = await res.json();
   // 스캔 데이터를 전역으로 저장 (결과 상세에서 참조)
   window._scannedMaterials = data.participants || [];
-  if (!data.participants?.length) { el.innerHTML = '<div class="empty-state"><div class="icon">📂</div><p>심사자료가 없습니다. 위에서 폴더 또는 파일을 선택하세요.</p></div>'; return; }
+  if (!data.participants?.length) { el.innerHTML = '<div class="empty-state"><div class="icon">📂</div><p>학생·답안 자료가 없습니다. 위에서 폴더 또는 파일을 선택하세요.</p></div>'; return; }
   const totalFiles = data.participants.reduce((s, p) => s + p.files.length, 0);
+  const participantUnit = currentProject.project_type === 'exam' || currentProject.setup?.participant_mode !== 'group' ? '명' : '모둠';
   el.innerHTML = `<div style="margin-bottom:12px;display:flex;gap:16px;flex-wrap:wrap">
-      <span class="badge badge-primary">👥 ${data.total_count}팀</span>
+      <span class="badge badge-primary">👥 ${data.total_count}${participantUnit}</span>
       <span class="badge badge-success">📄 ${totalFiles}개 파일</span>
       ${data.source_type === 'folder' && data.folder_path ? `<span class="badge" style="background:var(--surface2);color:var(--text2)">📁 ${esc(data.folder_path)}</span>` : ''}
     </div>
@@ -883,11 +1155,9 @@ function toggleAllMaterials(checked) {
 
 async function startSelectedGrading() {
   const selected = Array.from(document.querySelectorAll('.participant-check:checked')).map(el => parseInt(el.value));
-  if (!selected.length) return alert('채점할 팀을 선택하세요.');
-  if (confirm(`${selected.length}개 팀의 채점을 시작하시겠습니까?`)) {
-    // 채점 탭으로 이동 (UI 편의성)
-    const btn = document.querySelector('.sidebar button[onclick*="grading"]');
-    if (btn) btn.click();
+  if (!selected.length) return alert('채점할 학생 또는 모둠을 선택하세요.');
+  if (confirm(`${selected.length}개 대상의 채점을 시작하시겠습니까?`)) {
+    showWorkspaceStage('grading');
     startGrading(selected);
   }
 }
@@ -954,6 +1224,33 @@ async function removeMaterial(filePath, fileName) {
 }
 
 // ═══ 채점 실행 ═══
+async function updateGradingRoundContext(activeRound = null) {
+  if (!currentProject) return;
+  const element = document.getElementById('gradingRoundContext');
+  if (!element) return;
+  try {
+    const [roundRes, statusRes] = await Promise.all([
+      fetch(`/api/projects/${currentProject.id}/rounds`),
+      fetch('/api/status'),
+    ]);
+    const rounds = await roundRes.json();
+    const status = await statusRes.json();
+    if (status.running && status.project_id === currentProject.id) {
+      const round = activeRound || status.current_round || (rounds.at(-1)?.id ?? 1);
+      element.textContent = `${round}회차 진행 중 · ${status.completed_count || 0}/${status.total_count || 0}명 완료 · 성공 ${status.success_count || 0}명 · 실패 ${status.fail_count || 0}명`;
+      return;
+    }
+    if (!rounds.length) {
+      element.textContent = '아직 채점 회차가 없습니다. 첫 실행은 1회차로 기록됩니다.';
+      return;
+    }
+    const latest = rounds.at(-1);
+    element.textContent = `현재 ${rounds.length}개 회차 · 최근 ${latest.id}회차 ${latest.count}명 완료 · ‘새 회차’를 선택하면 ${latest.id + 1}회차로 기록됩니다.`;
+  } catch (error) {
+    element.textContent = '회차 정보를 불러오지 못했습니다. 채점 결과는 기존 방식대로 보존됩니다.';
+  }
+}
+
 async function renderGradingGrid() {
   if (!currentProject) return;
   const el = document.getElementById('gradingTeamGrid');
@@ -968,7 +1265,7 @@ async function renderGradingGrid() {
     const statData = await statRes.json();
     
     if (!matData.participants?.length) {
-      el.innerHTML = '<div style="font-size: 0.85rem; color: var(--text2);">심사자료가 없습니다.</div>';
+      el.innerHTML = '<div style="font-size: 0.85rem; color: var(--text2);">학생·답안 자료가 없습니다.</div>';
       return;
     }
     
@@ -1005,8 +1302,10 @@ async function startGrading(team_numbers = null) {
       return alert('채점 기준(Rubric)이 설정되지 않았습니다.\n\n설정 탭 → 채점 기준(Rubric)에서 영역과 항목을 추가하세요.');
     }
   }
-  if (!currentProject.materials?.folder_path && currentProject.materials?.source_type === 'folder') {
-    return alert('심사자료 폴더가 설정되지 않았습니다.\n\n심사자료 탭에서 폴더를 지정하세요.');
+  const materialResponse = await fetch(`/api/projects/${currentProject.id}/materials`);
+  const materialData = await materialResponse.json();
+  if (!materialData.participants?.length) {
+    return alert('채점할 학생·답안 자료가 없습니다.\n\n학생·답안 단계에서 폴더를 지정하거나 파일을 추가하세요.');
   }
   const body = {
     start_from: parseInt(document.getElementById('startFrom').value),
@@ -1024,6 +1323,7 @@ async function startGrading(team_numbers = null) {
   document.getElementById('btnStart').disabled = true;
   document.getElementById('btnStop').disabled = false;
   document.getElementById('gradingLog').innerHTML = '';
+  updateGradingRoundContext(data.round);
   renderGradingGrid();
   connectSSE();
 }
@@ -1065,6 +1365,7 @@ function connectSSE() {
       case 'finished': msg = `🏁 채점 완료! 성공: ${data.success}, 실패: ${data.fail}`; cls = 'success';
         document.getElementById('btnStart').disabled = false; document.getElementById('btnStop').disabled = true;
         if (eventSource) { eventSource.close(); eventSource = null; }
+        updateGradingRoundContext();
         break;
       case 'stopped': msg = `⏹ ${data.message}`; cls = 'error';
         document.getElementById('btnStart').disabled = false; document.getElementById('btnStop').disabled = true;
@@ -1086,6 +1387,10 @@ async function updateStats() {
   try {
     const res = await fetch('/api/status');
     state = await res.json();
+    const roundContext = document.getElementById('gradingRoundContext');
+    if (roundContext && state.running && state.project_id === currentProject?.id) {
+      roundContext.textContent = `${state.current_round || 1}회차 진행 중 · ${state.completed_count || 0}/${state.total_count || 0}명 완료 · 성공 ${state.success_count || 0}명 · 실패 ${state.fail_count || 0}명`;
+    }
     const status = document.getElementById('gradingCurrentStatus');
     if (status) {
       if (state.running) {
@@ -1204,8 +1509,7 @@ function renderResultsTable() {
 
 async function regradeSingle(teamNum) {
   if (!confirm(`${teamNum}번 학생을 현재 회차에서 다시 채점하시겠습니까?\n(기존 결과가 덮어씌워집니다)`)) return;
-  const btn = document.querySelector('.sidebar button[onclick*="grading"]');
-  if (btn) btn.click();
+  showWorkspaceStage('grading');
   const newRoundCheck = document.getElementById('newRound');
   if (newRoundCheck) newRoundCheck.checked = false;
   startGrading([teamNum]);
@@ -1699,18 +2003,36 @@ async function saveKeys() {
 
 // ═══ 유틸 ═══
 function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function formatDateTime(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return new Intl.DateTimeFormat('ko-KR', {
+    month: 'numeric',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(date);
+}
 
 // ═══ 초기화 ═══
 document.addEventListener('DOMContentLoaded', async () => {
   await loadProviders();
   await loadModels();
+  await populateWizardProviders();
+  renderWizardMaterialOptions();
   await loadProjects();
   const lastId = localStorage.getItem('lastProjectId');
   if (lastId && !currentProject) {
     try {
       await selectProject(lastId, true);
-      showTab('settings');
-    } catch(e) {}
+      showWorkspaceStage('overview');
+    } catch(e) {
+      localStorage.removeItem('lastProjectId');
+      currentProject = null;
+      updateAppShell();
+      showTab('projects');
+    }
   }
   setInterval(updateStats, 3000);
 });

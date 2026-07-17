@@ -30,6 +30,7 @@ from config import PROJECTS_DIR, AI_MODELS, OPENAI_AI_MODELS, SCALE_PRESETS, API
 from models.project import (
     ProjectConfig, Criterion, Category, MaterialsConfig,
     ExamConfig, ExamQuestion, ScoringElement, StudentRecord, ScanSplitConfig,
+    ProjectSetup, WORKFLOW_TYPES,
     create_project, save_project, load_project, list_projects, delete_project,
     generate_default_prompt, portable_project_path, resolve_project_path,
 )
@@ -44,6 +45,7 @@ from services.export import generate_excel
 from services.pdf_splitter import build_split_plan, split_integrated_pdf, SplitValidationError
 from services.providers import get_provider
 from services.providers.base import ProviderNeedsUserAction
+from services.overview import build_project_overview
 
 
 app = Flask(__name__, template_folder=str(BUNDLE_DIR / "templates"), static_folder=str(BUNDLE_DIR / "static"))
@@ -51,6 +53,27 @@ app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500MB
 app.json.sort_keys = False  # 모델 목록은 권장 순서(최신 기본 모델 우선)를 유지한다.
 
 PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _apply_project_setup(config: ProjectConfig, setup_data: dict | None) -> None:
+    """프로젝트 생성 마법사의 공통 정보를 안전하게 반영한다."""
+    data = setup_data or {}
+    participant_mode = data.get("participant_mode", config.setup.participant_mode)
+    if participant_mode not in {"individual", "group"}:
+        participant_mode = "individual"
+    ai_setup_mode = data.get("ai_setup_mode", config.setup.ai_setup_mode)
+    if ai_setup_mode not in {"recommended", "advanced"}:
+        ai_setup_mode = "recommended"
+    config.setup = ProjectSetup(
+        target=str(data.get("target", config.setup.target)),
+        assessment_name=str(data.get("assessment_name", config.setup.assessment_name)),
+        participant_mode=participant_mode,
+        expected_count=max(0, int(data.get("expected_count", config.setup.expected_count) or 0)),
+        materials_status=str(
+            data.get("materials_status", config.setup.materials_status) or "later"
+        ),
+        ai_setup_mode=ai_setup_mode,
+    )
 
 
 # ═══════════════════════════════════════════════════════════
@@ -389,11 +412,16 @@ def api_list_projects():
 @app.route("/api/projects", methods=["POST"])
 def api_create_project():
     data = request.json
+    workflow_type = data.get("workflow_type")
+    if workflow_type not in WORKFLOW_TYPES:
+        workflow_type = "exam" if data.get("project_type") == "exam" else "report"
     config = create_project(
         name=data.get("name", "새 프로젝트"),
         description=data.get("description", ""),
-        project_type=data.get("project_type", "report"),
+        project_type="exam" if workflow_type == "exam" else "report",
+        workflow_type=workflow_type,
     )
+    _apply_project_setup(config, data.get("setup"))
     
     # 기본 설정 적용
     if data.get("ai_model"):
@@ -437,7 +465,12 @@ def api_create_project():
     config.total_max_score = data.get("total_max_score", sum(cat.max_score for cat in config.categories) or 100)
     
     save_project(config)
-    return jsonify({"id": config.id, "name": config.name})
+    return jsonify({
+        "id": config.id,
+        "name": config.name,
+        "workflow_type": config.workflow_type,
+        "project_type": config.project_type,
+    })
 
 
 @app.route("/api/projects/<project_id>", methods=["GET"])
@@ -446,6 +479,14 @@ def api_get_project(project_id):
     if not config:
         return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
     return jsonify(config.to_dict())
+
+
+@app.route("/api/projects/<project_id>/overview")
+def api_project_overview(project_id):
+    config = load_project(project_id)
+    if not config:
+        return jsonify({"error": "프로젝트를 찾을 수 없습니다."}), 404
+    return jsonify(build_project_overview(config))
 
 
 @app.route("/api/projects/<project_id>", methods=["PUT"])
@@ -464,8 +505,17 @@ def api_update_project(project_id):
         config.ai_model = data["ai_model"]
     if "ai_provider" in data:
         config.ai_provider = data["ai_provider"]
-    if "project_type" in data and data["project_type"] in ("report", "exam"):
+    if "workflow_type" in data and data["workflow_type"] in WORKFLOW_TYPES:
+        config.workflow_type = data["workflow_type"]
+        config.project_type = "exam" if config.workflow_type == "exam" else "report"
+    elif "project_type" in data and data["project_type"] in ("report", "exam"):
         config.project_type = data["project_type"]
+        if config.project_type == "exam":
+            config.workflow_type = "exam"
+        elif config.workflow_type == "exam":
+            config.workflow_type = "report"
+    if "setup" in data:
+        _apply_project_setup(config, data["setup"])
     if "temperature" in data:
         config.temperature = max(0.0, min(2.0, float(data["temperature"])))
     
@@ -506,7 +556,8 @@ def api_update_project(project_id):
             # 채점 방식·문항이 바뀌면 실제 채점 프롬프트도 함께 갱신한다.
             # (서술형 프로젝트의 프롬프트는 UI에서 직접 편집하지 않는다.)
             config.prompt_template = generate_default_prompt(config)
-            config.prompt_template = generate_default_prompt(config)
+    elif "total_max_score" in data:
+        config.total_max_score = max(1, int(data["total_max_score"] or 1))
     
     save_project(config)
     return jsonify(config.to_dict())

@@ -12,7 +12,9 @@ from typing import Optional
 from config import PROJECTS_DIR
 
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
+
+WORKFLOW_TYPES = ("report", "competition", "exam")
 
 
 def _project_dir(project_id: str) -> Path:
@@ -178,6 +180,17 @@ class ExamConfig:
 
 
 @dataclass
+class ProjectSetup:
+    """프로젝트 생성 마법사에서 수집하는 공통 기본 정보."""
+    target: str = ""
+    assessment_name: str = ""
+    participant_mode: str = "individual"  # individual | group
+    expected_count: int = 0
+    materials_status: str = "later"
+    ai_setup_mode: str = "recommended"  # recommended | advanced
+
+
+@dataclass
 class ProjectConfig:
     """프로젝트 전체 설정"""
     id: str = ""
@@ -186,9 +199,12 @@ class ProjectConfig:
     created_at: str = ""
     updated_at: str = ""
 
-    # 스키마/프로젝트 유형. 기존 설정 파일은 report로 자동 마이그레이션한다.
+    # 보이는 업무 유형(workflow_type)과 내부 채점 엔진(project_type)을 분리한다.
+    # report와 competition은 report 엔진을 공유하고 exam만 exam 엔진을 사용한다.
     schema_version: int = CURRENT_SCHEMA_VERSION
-    project_type: str = "report"  # "report" | "exam"
+    workflow_type: str = "report"  # report | competition | exam
+    project_type: str = "report"  # report | exam
+    setup: ProjectSetup = field(default_factory=ProjectSetup)
     
     # AI 설정
     ai_model: str = "gpt-5.6-luna"
@@ -239,7 +255,9 @@ class ProjectConfig:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "schema_version": self.schema_version,
+            "workflow_type": self.workflow_type,
             "project_type": self.project_type,
+            "setup": asdict(self.setup),
             "ai_model": self.ai_model,
             "ai_provider": self.ai_provider,
             "temperature": self.temperature,
@@ -258,6 +276,28 @@ class ProjectConfig:
     
     @classmethod
     def from_dict(cls, data: dict) -> "ProjectConfig":
+        stored_project_type = data.get("project_type", "report")
+        workflow_type = data.get("workflow_type")
+        if workflow_type not in WORKFLOW_TYPES:
+            workflow_type = "exam" if stored_project_type == "exam" else "report"
+        project_type = "exam" if workflow_type == "exam" else "report"
+
+        setup_data = data.get("setup", {}) or {}
+        participant_mode = setup_data.get("participant_mode", "individual")
+        if participant_mode not in {"individual", "group"}:
+            participant_mode = "individual"
+        ai_setup_mode = setup_data.get("ai_setup_mode", "recommended")
+        if ai_setup_mode not in {"recommended", "advanced"}:
+            ai_setup_mode = "recommended"
+        setup = ProjectSetup(
+            target=str(setup_data.get("target", "")),
+            assessment_name=str(setup_data.get("assessment_name", "")),
+            participant_mode=participant_mode,
+            expected_count=max(0, int(setup_data.get("expected_count", 0) or 0)),
+            materials_status=str(setup_data.get("materials_status", "later") or "later"),
+            ai_setup_mode=ai_setup_mode,
+        )
+
         materials_data = data.get("materials", {}) or {}
         materials = MaterialsConfig(
             source_type=materials_data.get("source_type", "folder"),
@@ -374,7 +414,9 @@ class ProjectConfig:
             created_at=data.get("created_at", ""),
             updated_at=data.get("updated_at", ""),
             schema_version=max(CURRENT_SCHEMA_VERSION, int(data.get("schema_version", 1))),
-            project_type=data.get("project_type", "report"),
+            workflow_type=workflow_type,
+            project_type=project_type,
+            setup=setup,
             ai_model=normalized_model,
             ai_provider=normalized_provider,
             temperature=data.get("temperature", 0.2),
@@ -386,18 +428,28 @@ class ProjectConfig:
         )
 
 
-def create_project(name: str, description: str = "", project_type: str = "report") -> ProjectConfig:
+def create_project(
+    name: str,
+    description: str = "",
+    project_type: str = "report",
+    workflow_type: str | None = None,
+) -> ProjectConfig:
     """새 프로젝트 생성"""
     project_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
     now = datetime.now().isoformat()
     
+    if workflow_type not in WORKFLOW_TYPES:
+        workflow_type = "exam" if project_type == "exam" else "report"
+    internal_project_type = "exam" if workflow_type == "exam" else "report"
+
     config = ProjectConfig(
         id=project_id,
         name=name,
         description=description,
         created_at=now,
         updated_at=now,
-        project_type=project_type if project_type in ("report", "exam") else "report",
+        workflow_type=workflow_type,
+        project_type=internal_project_type,
     )
     
     # 프로젝트 디렉토리 생성
@@ -453,6 +505,11 @@ def list_projects() -> list[dict]:
                         if round_dirs:
                             team_count = len(list(round_dirs[-1].glob("team_*.json")))
                     
+                    stored_project_type = data.get("project_type", "report")
+                    workflow_type = data.get("workflow_type")
+                    if workflow_type not in WORKFLOW_TYPES:
+                        workflow_type = "exam" if stored_project_type == "exam" else "report"
+
                     projects.append({
                         "id": data["id"],
                         "name": data["name"],
@@ -461,7 +518,8 @@ def list_projects() -> list[dict]:
                         "updated_at": data.get("updated_at", ""),
                         "ai_model": data.get("ai_model", ""),
                         "ai_provider": data.get("ai_provider", "gemini_api"),
-                        "project_type": data.get("project_type", "report"),
+                        "workflow_type": workflow_type,
+                        "project_type": "exam" if workflow_type == "exam" else "report",
                         "round_count": round_count,
                         "team_count": team_count,
                         "criteria_count": (

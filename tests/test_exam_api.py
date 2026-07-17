@@ -78,7 +78,7 @@ def test_exam_upload_split_and_approval_flow(tmp_path, monkeypatch):
     assert "examStudents" not in root_html[exam_section:materials_section]
 
 
-def test_project_type_can_be_changed_and_provider_has_own_models(tmp_path, monkeypatch):
+def test_workflow_type_can_be_changed_and_provider_has_own_models(tmp_path, monkeypatch):
     configure_temp_projects(tmp_path, monkeypatch)
     client = app_module.app.test_client()
 
@@ -91,26 +91,29 @@ def test_project_type_can_be_changed_and_provider_has_own_models(tmp_path, monke
     assert list(api_models)[0] == "gemini-3.5-flash"
     assert api_models["gemini-3.5-flash"]["name"] == "Gemini 3.5 Flash"
 
-    web_models = client.get("/api/models?provider=gemini_web").get_json()
-    assert list(web_models)[0] == "gemini-web-auto"
-    assert "권장" in web_models["gemini-web-auto"]["name"]
-    assert "3.5 Flash" in web_models["gemini-web-flash"]["name"]
+    openai_models = client.get("/api/models?provider=openai_api").get_json()
+    assert list(openai_models)[0] == "gpt-5.6-luna"
+    assert "권장" in openai_models["gpt-5.6-luna"]["name"]
 
-    created = client.post("/api/projects", json={"name": "유형 전환", "project_type": "report"})
+    created = client.post(
+        "/api/projects",
+        json={"name": "유형 전환", "workflow_type": "report"},
+    )
     project_id = created.get_json()["id"]
     changed = client.put(
         f"/api/projects/{project_id}",
         json={
-            "project_type": "exam",
-            "ai_provider": "gemini_web",
-            "ai_model": "gemini-web-flash",
+            "workflow_type": "exam",
+            "ai_provider": "openai_api",
+            "ai_model": "gpt-5.6-luna",
         },
     )
     assert changed.status_code == 200
     saved = changed.get_json()
+    assert saved["workflow_type"] == "exam"
     assert saved["project_type"] == "exam"
-    assert saved["ai_provider"] == "gemini_web"
-    assert saved["ai_model"] == "gemini-web-flash"
+    assert saved["ai_provider"] == "openai_api"
+    assert saved["ai_model"] == "gpt-5.6-luna"
 
 
 def test_generate_rubric_rejects_empty_or_directory_question_path(tmp_path, monkeypatch):
@@ -313,7 +316,7 @@ def test_new_round_defaults_to_round_one_then_advances_when_results_exist(tmp_pa
             pass
 
     monkeypatch.setattr(app_module.threading, "Thread", DummyThread)
-    monkeypatch.setattr(app_module, "load_api_keys", lambda: {"google": "test-key"})
+    monkeypatch.setattr(app_module, "load_api_keys", lambda: {"openai": "test-key"})
     client = app_module.app.test_client()
     created = client.post("/api/projects", json={"name": "회차 테스트", "project_type": "exam"})
     project_id = created.get_json()["id"]

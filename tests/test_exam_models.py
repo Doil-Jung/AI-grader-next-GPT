@@ -23,8 +23,9 @@ def test_legacy_google_provider_is_migrated():
     assert config.ai_provider == "gemini_api"
 
 
-def test_latest_flash_is_default_and_preview_alias_is_migrated():
-    assert ProjectConfig().ai_model == "gemini-3.5-flash"
+def test_openai_is_default_and_legacy_gemini_alias_is_migrated():
+    assert ProjectConfig().ai_provider == "openai_api"
+    assert ProjectConfig().ai_model == "gpt-5.6-luna"
     config = ProjectConfig.from_dict({
         "name": "이전 모델 프로젝트",
         "ai_model": "gemini-3-flash-preview",
@@ -32,13 +33,14 @@ def test_latest_flash_is_default_and_preview_alias_is_migrated():
     assert config.ai_model == "gemini-3.5-flash"
 
 
-def test_api_model_is_mapped_to_web_model_for_existing_project():
+def test_removed_web_provider_is_migrated_to_supported_openai_provider():
     config = ProjectConfig.from_dict({
         "name": "정액형 프로젝트",
         "ai_provider": "gemini_web",
         "ai_model": "gemini-3.5-flash",
     })
-    assert config.ai_model == "gemini-web-flash"
+    assert config.ai_provider == "openai_api"
+    assert config.ai_model == "gpt-5.6-luna"
 
 
 def test_exam_schema_and_score_computation():
@@ -55,6 +57,7 @@ def test_exam_schema_and_score_computation():
     model = build_evaluation_model(config)
     value = model(
         team_number=1, team_name="학생 1", q1=4,
+        q1_has_answer=True,
         q1_answer_summary="핵심 개념을 설명함", q1_reason="한 요소가 부족함",
         q1_confidence=0.8, q1_review_required=False, overall_comment="검토 의견",
     )
